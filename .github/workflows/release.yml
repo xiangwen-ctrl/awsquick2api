@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Determine version tag
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Run checks and tests
+        run: |
+          CGO_ENABLED=0 go vet ./...
+          go test -race -count=1 ./...
+          node --check internal/panel/web/app.js
+
+      - name: Build cross-platform binaries
+        env:
+          CGO_ENABLED: "0"
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          mkdir -p release-assets
+          LDFLAGS="-s -w -X main.appVersion=${VERSION}"
+
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="${LDFLAGS} -H=windowsgui" -o release-assets/awsquick2api-windows-amd64.exe ./cmd/awsquick2api
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="${LDFLAGS}" -o release-assets/awsquick2api-windows-amd64-console.exe ./cmd/awsquick2api
+          GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="${LDFLAGS}" -o release-assets/awsquick2api-linux-amd64 ./cmd/awsquick2api
+          GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="${LDFLAGS}" -o release-assets/awsquick2api-linux-arm64 ./cmd/awsquick2api
+          GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags="${LDFLAGS}" -o release-assets/awsquick2api-darwin-arm64 ./cmd/awsquick2api
+          GOOS=darwin  GOARCH=amd64 go build -trimpath -ldflags="${LDFLAGS}" -o release-assets/awsquick2api-darwin-amd64 ./cmd/awsquick2api
+
+          (cd release-assets && sha256sum awsquick2api-* > SHA256SUMS.txt)
+          ls -lh release-assets
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          cat > release-notes.md <<'EOF'
+          ## AWSQuick2API ${TAG}
+
+          ### 下载文件
+          | 文件 | 平台 | 说明 |
+          | --- | --- | --- |
+          | `awsquick2api-windows-amd64.exe` | Windows x64 | 系统托盘版（推荐，双击后台运行） |
+          | `awsquick2api-windows-amd64-console.exe` | Windows x64 | 控制台版（适合命令行调试 / 迁移） |
+          | `awsquick2api-linux-amd64` | Linux x86_64 | 静态单二进制 |
+          | `awsquick2api-linux-arm64` | Linux ARM64 | 静态单二进制 |
+          | `awsquick2api-darwin-arm64` | macOS Apple Silicon | 原生静态二进制 |
+          | `awsquick2api-darwin-amd64` | macOS Intel | 原生静态二进制 |
+          | `SHA256SUMS.txt` | 校验和 | SHA-256 校验文件 |
+
+          ### 快速使用
+          1. 下载对应平台文件直接运行，首次启动自动生成 `config.json`。
+          2. 浏览器访问 `http://127.0.0.1:8045/panel/`，输入 `config.json` 中的 `admin_key` 解锁并添加账号。
+          3. 在客户端中填写 `http://127.0.0.1:8045` 和 `config.json` 中的 `api_key` 即可使用。
+          EOF
+          sed -i "s/\${TAG}/${TAG}/g" release-notes.md
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" release-assets/* --clobber
+            gh release edit "${TAG}" --notes-file release-notes.md
+          else
+            gh release create "${TAG}" release-assets/* \
+              --title "AWSQuick2API ${TAG}" \
+              --notes-file release-notes.md \
+              --generate-notes
+          fi

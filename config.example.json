@@ -1,0 +1,70 @@
+{
+  "listen": "127.0.0.1:8045",
+  "api_key": "replace_with_your_api_key",
+  "admin_key": "replace_with_your_admin_key",
+  "auth_dir": "./auths",
+  "data_dir": "./data",
+  "server": {
+    "read_timeout_seconds": 300,
+    "shutdown_timeout_seconds": 30,
+    "max_payload_bytes": 67108864
+  },
+  "upstream": {
+    "app_version": "1.2.4660",
+    "surface": "QUICK_WORK_DESKTOP_WINDOWS",
+    "stage": "prod",
+    "default_region": "us-east-1",
+    "callback_port": 18080,
+    "proxy_url": "",
+    "timeout_seconds": 300,
+    "handshake_timeout_seconds": 20,
+    "idle_timeout_seconds": 120,
+    "header_wait_seconds": 10,
+    "keepalive_seconds": 25,
+    "timezone": "UTC",
+    "locale": "en-US",
+    "default_model": "smart",
+    "stateful": true,
+    "attachments": true,
+    "max_frame_bytes": 63000,
+    "keep_sessions": false,
+    "web_search": false,
+    "show_quick_tools": true,
+    "stable_device_id": true
+  },
+  "pool": {
+    "max_in_flight": 2,
+    "soft_cooldown_seconds": 60,
+    "soft_cooldown_max_seconds": 3600,
+    "breaker_threshold": 3,
+    "breaker_cooldown_seconds": 900,
+    "selection_strategy": "weighted",
+    "max_rotate": 3
+  },
+  "thinking": {
+    "policy": "client",
+    "default_effort": "off",
+    "model_overrides": {}
+  },
+  "schedule": {
+    "quota_refresh_enabled": true,
+    "quota_refresh_minutes": 10,
+    "token_refresh_enabled": true,
+    "token_refresh_check_minutes": 1,
+    "token_refresh_advance_minutes": 10
+  },
+  "session": {
+    "enabled": true,
+    "ttl_minutes": 30
+  },
+  "features": {
+    "claude_aliases": true,
+    "request_archive": true,
+    "empty_retry_enabled": true
+  },
+  "models": {
+    "hidden": [],
+    "allowed": [],
+    "expose_effort_variants": false
+  }
+}

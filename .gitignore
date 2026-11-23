@@ -1,0 +1,23 @@
+# Local config, runtime data, and credentials
+config.json
+models.json
+auths/
+data/
+exports/
+*.quickpool.json
+*.enc.json
+encryption.key
+*.key
+*.har
+
+# Compiled binaries & release bundles
+dist/
+*.exe
+/awsquick2api
+/awsquick2api-*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

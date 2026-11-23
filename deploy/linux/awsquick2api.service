@@ -1,0 +1,19 @@
+[Unit]
+Description=AWSQuick2API Multi-Account Amazon Quick Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/awsquick2api
+ExecStart=/opt/awsquick2api/awsquick2api -no-tray -config /opt/awsquick2api/config.json
+Restart=on-failure
+RestartSec=5s
+Environment=AWSQUICK_NO_TRAY=1
+Environment=GOMEMLIMIT=180MiB
+MemoryMax=256M
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

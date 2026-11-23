@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Go vet
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
+      - name: Go test (Linux with race)
+        if: runner.os == 'Linux'
+        run: go test -race -count=1 ./...
+
+      - name: Go test (Windows)
+        if: runner.os == 'Windows'
+        env:
+          CGO_ENABLED: "0"
+        run: go test -count=1 ./...
+
+      - name: Check panel JS syntax
+        run: node --check internal/panel/web/app.js
+
+      - name: Build binary
+        if: runner.os == 'Linux'
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/awsquick2api-linux-amd64 ./cmd/awsquick2api
+          GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/awsquick2api-linux-arm64 ./cmd/awsquick2api
+
+      - name: Build Windows GUI binary
+        if: runner.os == 'Windows'
+        env:
+          CGO_ENABLED: "0"
+        run: go build -trimpath -ldflags="-s -w -H=windowsgui" -o awsquick2api.exe ./cmd/awsquick2api
