@@ -107,6 +107,7 @@ func (h *Handler) loadSnapshot() config.LiveSnapshot {
 		Thinking:          config.Default().Thinking,
 		ClaudeAliases:     true,
 		EmptyRetryEnabled: true,
+		StrictPrivacyDLP:  true,
 		MaxRotate:         h.cfg.MaxRotate,
 	}
 }
@@ -258,6 +259,8 @@ func (h *Handler) runChatTurn(
 	slot, _, suffixEffort, _ := cat.Resolve(reqModel, snap.Upstream.DefaultModel, snap.ClaudeAliases)
 	req.Slot = slot
 	req.ThinkingEffort = upstream.ResolveThinkingEffort(snap.Thinking, reqModel, slot, suffixEffort, req.ThinkingEffort)
+	strictDLP := snap.StrictPrivacyDLP
+	req.StrictPrivacyDLP = &strictDLP
 	if req.ConversationID == "" {
 		req.ConversationID = upstream.ConversationIDFromHeaders(r.Header)
 	}

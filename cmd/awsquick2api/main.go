@@ -33,7 +33,7 @@ import (
 	"awsquick2api/internal/upstream"
 )
 
-var appVersion = "0.1.0"
+var appVersion = "0.1.1"
 
 func main() {
 	var (

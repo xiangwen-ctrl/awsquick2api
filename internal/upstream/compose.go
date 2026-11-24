@@ -23,6 +23,7 @@ type ChatRequest struct {
 	WebSearch         *bool
 	ConversationID    string
 	Stream            bool
+	StrictPrivacyDLP  *bool
 }
 
 type preparedTurn struct {
@@ -30,6 +31,7 @@ type preparedTurn struct {
 	convo         []map[string]any
 	keys          []string
 	system        string
+	privacyNote   string
 	toolDefs      []ToolDef
 	choice        ToolChoice
 	parallel      bool
@@ -77,10 +79,20 @@ func prepareTurn(req ChatRequest, cfg config.UpstreamConfig) (*preparedTurn, err
 	respFmt := ParseResponseFormat(req.ResponseFormat)
 	respFmtPrompt := BuildResponseFormatPrompt(respFmt)
 
+	strictDLP := true
+	if req.StrictPrivacyDLP != nil {
+		strictDLP = *req.StrictPrivacyDLP
+	}
+	privacyNote := ""
+	if strictDLP {
+		privacyNote = PrivacyPreferenceNote
+	}
+
 	pt := &preparedTurn{
 		req:           req,
 		convo:         convo,
 		system:        SystemText(req.Messages),
+		privacyNote:   privacyNote,
 		toolDefs:      toolDefs,
 		choice:        choice,
 		parallel:      parallel,
@@ -121,7 +133,7 @@ func (p *preparedTurn) toolsPrompt(detail string) string {
 
 func (p *preparedTurn) joinCustom(sys, tools string) string {
 	var parts []string
-	for _, s := range []string{sys, tools, p.respFmtPrompt} {
+	for _, s := range []string{sys, p.privacyNote, tools, p.respFmtPrompt} {
 		if strings.TrimSpace(s) != "" {
 			parts = append(parts, s)
 		}
@@ -151,7 +163,7 @@ func middleCut(text string, keepRunes int) string {
 	if len(runes) <= keepRunes {
 		return text
 	}
-	note := []rune("\n…[shortened to fit Amazon Quick's 64 KB message limit]…\n")
+	note := []rune("\n…[shortened to fit 64 KB message limit]…\n")
 	if keepRunes <= len(note) {
 		return string(runes[:max(0, keepRunes)])
 	}

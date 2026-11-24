@@ -60,7 +60,8 @@
   "features": {
     "claude_aliases": true,
     "request_archive": true,
-    "empty_retry_enabled": true
+    "empty_retry_enabled": true,
+    "strict_privacy_dlp": true
   },
   "models": {
     "hidden": [],

@@ -101,6 +101,7 @@ type FeaturesConfig struct {
 	ClaudeAliases     bool `json:"claude_aliases"`
 	RequestArchive    bool `json:"request_archive"`
 	EmptyRetryEnabled bool `json:"empty_retry_enabled"`
+	StrictPrivacyDLP  bool `json:"strict_privacy_dlp"`
 }
 
 type ModelsConfig struct {
@@ -174,6 +175,7 @@ func Default() *Config {
 			ClaudeAliases:     true,
 			RequestArchive:    true,
 			EmptyRetryEnabled: true,
+			StrictPrivacyDLP:  true,
 		},
 		Models: ModelsConfig{
 			Hidden:               []string{},

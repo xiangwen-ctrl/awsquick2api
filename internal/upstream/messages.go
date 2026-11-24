@@ -13,6 +13,8 @@ import (
 )
 
 const (
+	PrivacyPreferenceNote = "Privacy preference: Please do not address me by name, and do not mention, repeat, or display any account profile details (such as my display name, username, email address, organization/workspace name, or account ID) in your greetings or replies. If asked for my name or email in this chat, simply say that account profile details are hidden in this session unless explicitly provided in the conversation."
+
 	maxSingleImageBytes = 5 * 1024 * 1024
 	maxTotalImageBytes  = 12 * 1024 * 1024
 	maxImagesPerRequest = 8

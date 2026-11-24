@@ -116,6 +116,11 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 		return ChatResult{}, err
 	}
 	acctKey := acct.TenantURL + "|" + acct.UID
+	strictDLP := true
+	if req.StrictPrivacyDLP != nil {
+		strictDLP = *req.StrictPrivacyDLP
+	}
+	piiPolicy := buildAccountPrivacyPolicy(acct, req.Messages, strictDLP)
 
 	runAttempt := func(thread *ThreadEntry) (ChatResult, error) {
 		threadID := auth.NewUUID()
@@ -130,44 +135,60 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 			return ChatResult{}, cerr
 		}
 
-		// Stream wrapper with BridgeStream when client tools are declared.
+		// Stream wrapper with PII redaction and BridgeStream when client tools are declared.
 		var (
 			bridge      *BridgeStream
 			streamedTxt strings.Builder
 			streamedRsn strings.Builder
+			textGuard   *privacyStreamRedactor
+			rsnGuard    *privacyStreamRedactor
 		)
+		initStreamGuards := func() {
+			streamedTxt.Reset()
+			streamedRsn.Reset()
+			if pt.bridge && req.Stream {
+				bridge = NewBridgeStream(pt.bridgeAllowed, func(t string) {
+					streamedTxt.WriteString(t)
+					if onEvent != nil {
+						onEvent(ChatEvent{Type: "text", Text: t})
+					}
+				})
+			} else {
+				bridge = nil
+			}
+			rsnGuard = newPrivacyPolicyStreamRedactor(piiPolicy, func(t string) {
+				streamedRsn.WriteString(t)
+				if onEvent != nil {
+					onEvent(ChatEvent{Type: "reasoning", Text: t})
+				}
+			})
+			textGuard = newPrivacyPolicyStreamRedactor(piiPolicy, func(t string) {
+				if pt.bridge && req.Stream {
+					bridge.Push(t)
+					return
+				}
+				if !pt.bridge && pt.respFmt.Type == "text" {
+					streamedTxt.WriteString(t)
+					if onEvent != nil {
+						onEvent(ChatEvent{Type: "text", Text: t})
+					}
+				}
+			})
+		}
+		initStreamGuards()
+
 		emitWrapped := func(ev ChatEvent) {
 			if ev.Text == "" {
 				return
 			}
 			if ev.Type == "reasoning" {
-				streamedRsn.WriteString(ev.Text)
-				if onEvent != nil {
-					onEvent(ev)
-				}
+				rsnGuard.Push(ev.Text)
 				return
 			}
 			if ev.Type != "text" {
 				return
 			}
-			if pt.bridge && req.Stream {
-				bridge.Push(ev.Text)
-				return
-			}
-			if !pt.bridge && pt.respFmt.Type == "text" {
-				streamedTxt.WriteString(ev.Text)
-				if onEvent != nil {
-					onEvent(ev)
-				}
-			}
-		}
-		if pt.bridge && req.Stream {
-			bridge = NewBridgeStream(pt.bridgeAllowed, func(t string) {
-				streamedTxt.WriteString(t)
-				if onEvent != nil {
-					onEvent(ChatEvent{Type: "text", Text: t})
-				}
-			})
+			textGuard.Push(ev.Text)
 		}
 
 		res, werr := c.executeWSTurn(ctx, acct, sess, cfg, composed.Input, emitWrapped)
@@ -177,16 +198,7 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 				smallerLimit := int(float64(cfg.MaxFrameBytes) * 0.7)
 				if smallerLimit >= 4096 {
 					if comp2, c2err := c.composeTurn(ctx, acct, sess, cfg, pt, thread, threadID, smallerLimit); c2err == nil {
-						streamedTxt.Reset()
-						streamedRsn.Reset()
-						if pt.bridge && req.Stream {
-							bridge = NewBridgeStream(pt.bridgeAllowed, func(t string) {
-								streamedTxt.WriteString(t)
-								if onEvent != nil {
-									onEvent(ChatEvent{Type: "text", Text: t})
-								}
-							})
-						}
+						initStreamGuards()
 						res, werr = c.executeWSTurn(ctx, acct, sess, cfg, comp2.Input, emitWrapped)
 						if werr == nil {
 							composed = comp2
@@ -202,6 +214,12 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 			return ChatResult{}, werr
 		}
 
+		rsnGuard.Finish()
+		textGuard.Finish()
+
+		res.Text = piiPolicy.Scrub(res.Text)
+		res.Reasoning = piiPolicy.Scrub(res.Reasoning)
+
 		// Finalize tool calls & response_format output.
 		var calls []ToolCall
 		finalText := res.Text
@@ -211,6 +229,9 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 				finalText = streamedTxt.String()
 			} else {
 				finalText, calls = ParseClientToolCalls(res.Text, pt.bridgeAllowed)
+			}
+			for i := range calls {
+				calls[i].Arguments = piiPolicy.Scrub(calls[i].Arguments)
 			}
 			if !pt.parallel && len(calls) > 1 {
 				calls = calls[:1]

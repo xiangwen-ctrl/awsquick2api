@@ -17,6 +17,7 @@ type LiveSnapshot struct {
 	MaxRotate            int
 	ClaudeAliases        bool
 	EmptyRetryEnabled    bool
+	StrictPrivacyDLP     bool
 	HiddenModels         map[string]bool
 	AllowedModels        map[string]bool
 	AllowlistEnabled     bool
@@ -86,6 +87,7 @@ func SnapshotFromConfig(cfg *Config) LiveSnapshot {
 		MaxRotate:            cfg.Pool.MaxRotate,
 		ClaudeAliases:        cfg.Features.ClaudeAliases,
 		EmptyRetryEnabled:    cfg.Features.EmptyRetryEnabled,
+		StrictPrivacyDLP:     cfg.Features.StrictPrivacyDLP,
 		HiddenModels:         hidden,
 		AllowedModels:        allowed,
 		AllowlistEnabled:     len(allowed) > 0,

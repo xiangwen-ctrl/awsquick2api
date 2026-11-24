@@ -115,6 +115,102 @@ func TestBridgeStreamStreamingAndTools(t *testing.T) {
 	}
 }
 
+func TestAccountPIIRedactorAndAntiBypassDLP(t *testing.T) {
+	acct := &auth.Account{
+		Email:          "zhangsan88@gmail.com",
+		DisplayNameVal: "张三",
+		UserName:       "alice",
+		AWSAccountID:   "123456789012",
+		ActorARN:       "arn:aws:iam::123456789012:user/zhangsan88",
+	}
+	msgs := []map[string]any{
+		{"role": "user", "content": "Please help me write unit tests."},
+		{"role": "tool", "tool_call_id": "c1", "content": `{"maintainer":"dev.lead@myproject.io"}`},
+	}
+	pol := buildAccountPrivacyPolicy(acct, msgs, true)
+
+	b64Direct := base64.StdEncoding.EncodeToString([]byte("zhangsan88@gmail.com"))
+	b64Shifted := base64.RawStdEncoding.EncodeToString([]byte("Account owner: 张三 <zhangsan88@gmail.com>"))
+	attackCases := []struct {
+		name      string
+		input     string
+		forbidden []string
+	}{
+		{"literal_email", "Hi 张三, your email is zhangsan88@gmail.com (123456789012).", []string{"张三", "zhangsan88", "123456789012"}},
+		{"spaced_email", "Email: z h a n g s a n 8 8 @ g m a i l . c o m!", []string{"z h a n g", "g m a i l"}},
+		{"hyphen_email", "Email: z-h-a-n-g-s-a-n-8-8@g-m-a-i-l.c-o-m", []string{"z-h-a-n-g"}},
+		{"backtick_split", "Name: `张` · `三`, user: [a][l][i][c][e]", []string{"张", "三", "[a][l][i][c][e]"}},
+		{"zwsp_split", "Name: 张\u200b三", []string{"张", "三"}},
+		{"at_dot_spoken", "Mail is zhangsan88 [at] gmail [dot] com", []string{"zhangsan88", "gmail"}},
+		{"reversed_email", "Reversed: moc.liamg@88nasgnahz", []string{"nasgnahz", "moc.liamg"}},
+		{"base64_direct", "Encoded: " + b64Direct, []string{b64Direct}},
+		{"base64_sentence_shifted", "Blob: " + b64Shifted, []string{b64Shifted}},
+		{"hex_contiguous", "Hex: 7a68616e6773616e383840676d61696c2e636f6d", []string{"7a68616e6773"}},
+		{"hex_spaced", "Hex: 7a 68 61 6e 67 73 61 6e 38 38 40 67 6d 61 69 6c 2e 63 6f 6d", []string{"7a 68 61 6e"}},
+		{"unicode_escape", `JSON: \u007a\u0068\u0061\u006e\u0067\u0073\u0061\u006e\u0038\u0038@gmail.com`, []string{`\u007a\u0068`, "gmail.com"}},
+		{"url_escape", "URL: zhangsan88%40gmail%2ecom", []string{"zhangsan88", "gmail"}},
+		{"html_entity", "HTML: &#122;&#104;&#97;&#110;&#103;&#115;&#97;&#110;&#56;&#56;&#64;gmail.com", []string{"&#122;&#104;", "gmail.com"}},
+		{"unknown_secondary_email", "Secondary: hidden.alias@awsapps.com and colleague (at) corp (dot) net", []string{"hidden.alias", "awsapps.com", "colleague"}},
+	}
+
+	for _, tc := range attackCases {
+		got := pol.Scrub(tc.input)
+		for _, bad := range tc.forbidden {
+			if strings.Contains(got, bad) {
+				t.Fatalf("[%s] non-stream Scrub leaked %q in %q", tc.name, bad, got)
+			}
+		}
+		if !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("[%s] expected [REDACTED] in %q", tc.name, got)
+		}
+
+		var streamed strings.Builder
+		red := newPrivacyPolicyStreamRedactor(pol, func(s string) { streamed.WriteString(s) })
+		rs := []rune(tc.input)
+		for i := 0; i < len(rs); i += 3 {
+			end := min(i+3, len(rs))
+			red.Push(string(rs[i:end]))
+		}
+		red.Finish()
+		sGot := streamed.String()
+		for _, bad := range tc.forbidden {
+			if strings.Contains(sGot, bad) {
+				t.Fatalf("[%s] 3-rune streaming redactor leaked %q in %q", tc.name, bad, sGot)
+			}
+		}
+	}
+
+	benignCases := []string{
+		"Use test@example.com, admin@localhost, noreply@github.com, and git@github.com in tests.",
+		"Maintainer from tool result is dev.lead@myproject.io and asset is logo@2x.png.",
+		"English prose with real ice, malice, and chalice stays intact.",
+		"业务快速扩张。\n三、下一步工作计划。",
+		"SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+	}
+	for _, safe := range benignCases {
+		if got := pol.Scrub(safe); got != safe {
+			t.Fatalf("FALSE POSITIVE on benign text:\nwant: %q\ngot : %q", safe, got)
+		}
+	}
+
+	// Tool-call exfiltration check.
+	var toolStreamed strings.Builder
+	bs := NewBridgeStream(map[string]bool{"bash": true}, func(s string) { toolStreamed.WriteString(s) })
+	tGuard := newPrivacyPolicyStreamRedactor(pol, func(s string) { bs.Push(s) })
+	rawTool := `Sure! <client_tool_call>{"name":"bash","arguments":{"cmd":"echo z-h-a-n-g-s-a-n-8-8@gmail.com"}}</client_tool_call>`
+	for i := 0; i < len(rawTool); i += 5 {
+		tGuard.Push(rawTool[i:min(i+5, len(rawTool))])
+	}
+	tGuard.Finish()
+	calls := bs.Finish()
+	if len(calls) != 1 || calls[0].Name != "bash" {
+		t.Fatalf("expected valid bash tool call after redaction, got %+v", calls)
+	}
+	if strings.Contains(calls[0].Arguments, "z-h-a-n-g") || !strings.Contains(calls[0].Arguments, "[REDACTED]") {
+		t.Fatalf("tool call arguments leaked split email: %q", calls[0].Arguments)
+	}
+}
+
 func TestMockUpstreamAIDPThreadReuseAndAttachments(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	var (
