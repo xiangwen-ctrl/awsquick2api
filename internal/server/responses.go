@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"awsquick2api/internal/auth"
+	"awsquick2api/internal/reqlog"
 	"awsquick2api/internal/upstream"
 )
 
@@ -51,13 +52,15 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setGatewayResponseHeaders(w, out.ReqID, out.Account, out.Result.Usage.ResolvedModel, out.Result.ThreadReused)
-		writeJSON(w, http.StatusOK, buildResponsesObject(respID, created, reqModel, "completed", out.Result, customTools))
+		writeJSON(w, http.StatusOK, buildResponsesObject(respID, created, reqModel, "completed", out.Result, customTools, nil))
 		return
 	}
 
 	flusher, _ := w.(http.Flusher)
 	var (
 		writeMu      sync.Mutex
+		keepalive    *sseKeepalive
+		itemIDs      responseItemIDs
 		started      bool
 		seq          int
 		outIdx       int
@@ -70,6 +73,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		textAcc      strings.Builder
 		reasoningAcc strings.Builder
 	)
+	defer func() { keepalive.Stop() }()
 
 	sendEvent := func(eventName string, payload map[string]any) {
 		writeMu.Lock()
@@ -177,6 +181,14 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		sendEvent("response.created", map[string]any{"response": baseResp})
 		sendEvent("response.in_progress", map[string]any{"response": baseResp})
+		keepalive = startSSEKeepalive(r.Context(), sseKeepaliveInterval, func() {
+			writeMu.Lock()
+			defer writeMu.Unlock()
+			_, _ = fmt.Fprint(w, ": keepalive\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+		})
 	}
 
 	onEvent := func(ev upstream.ChatEvent) {
@@ -187,6 +199,9 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 				rsnIdx = outIdx
 				outIdx++
 				rsnItemID = "rs_" + strings.ReplaceAll(auth.NewUUID(), "-", "")
+				if itemIDs.Reasoning == "" {
+					itemIDs.Reasoning = rsnItemID
+				}
 				sendEvent("response.output_item.added", map[string]any{
 					"output_index": rsnIdx,
 					"item": map[string]any{
@@ -220,6 +235,9 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 				msgIdx = outIdx
 				outIdx++
 				msgItemID = "msg_" + strings.ReplaceAll(auth.NewUUID(), "-", "")
+				if itemIDs.Message == "" {
+					itemIDs.Message = msgItemID
+				}
 				sendEvent("response.output_item.added", map[string]any{
 					"output_index": msgIdx,
 					"item": map[string]any{
@@ -252,6 +270,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out, ue := h.runChatTurn(r.Context(), r, "/v1/responses", reqModel, upReq, onStart, onEvent)
+	keepalive.Stop()
 	if ue != nil {
 		if ue.StatusCode == 499 {
 			return
@@ -272,7 +291,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 				"model":      reqModel,
 				"error": map[string]any{
 					"code":    ue.Code,
-					"message": ue.Error(),
+					"message": reqlog.ScrubCredentials(ue.Error()),
 				},
 			},
 		})
@@ -286,6 +305,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		idx := outIdx
 		outIdx++
 		itemID := "fc_" + strings.ReplaceAll(auth.NewUUID(), "-", "")
+		itemIDs.Calls = append(itemIDs.Calls, itemID)
 		if customTools[tc.Name] {
 			inputStr := extractCustomToolInput(tc.Arguments)
 			item := map[string]any{
@@ -356,15 +376,36 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sendEvent("response.completed", map[string]any{
-		"response": buildResponsesObject(respID, created, reqModel, "completed", out.Result, customTools),
+		"response": buildResponsesObject(respID, created, reqModel, "completed", out.Result, customTools, &itemIDs),
 	})
 }
 
-func buildResponsesObject(respID string, created int64, model, status string, res upstream.ChatResult, customTools map[string]bool) map[string]any {
+// responseItemIDs carries the output item IDs already announced on the SSE stream so
+// that response.completed reports the same IDs instead of minting fresh ones.
+type responseItemIDs struct {
+	Reasoning string
+	Message   string
+	Calls     []string
+}
+
+func newItemID(prefix string) string {
+	return prefix + strings.ReplaceAll(auth.NewUUID(), "-", "")
+}
+
+func buildResponsesObject(respID string, created int64, model, status string, res upstream.ChatResult, customTools map[string]bool, ids *responseItemIDs) map[string]any {
+	if ids == nil {
+		ids = &responseItemIDs{}
+	}
+	pick := func(existing, prefix string) string {
+		if existing != "" {
+			return existing
+		}
+		return newItemID(prefix)
+	}
 	output := make([]map[string]any, 0, 2+len(res.ToolCalls))
 	if res.Reasoning != "" {
 		output = append(output, map[string]any{
-			"id":      "rs_" + strings.ReplaceAll(auth.NewUUID(), "-", ""),
+			"id":      pick(ids.Reasoning, "rs_"),
 			"type":    "reasoning",
 			"status":  "completed",
 			"summary": []map[string]any{{"type": "summary_text", "text": res.Reasoning}},
@@ -372,7 +413,7 @@ func buildResponsesObject(respID string, created int64, model, status string, re
 	}
 	if strings.TrimSpace(res.Text) != "" {
 		output = append(output, map[string]any{
-			"id":     "msg_" + strings.ReplaceAll(auth.NewUUID(), "-", ""),
+			"id":     pick(ids.Message, "msg_"),
 			"type":   "message",
 			"status": "completed",
 			"role":   "assistant",
@@ -385,10 +426,15 @@ func buildResponsesObject(respID string, created int64, model, status string, re
 			},
 		})
 	}
-	for _, tc := range res.ToolCalls {
+	for i, tc := range res.ToolCalls {
+		callItemID := ""
+		if i < len(ids.Calls) {
+			callItemID = ids.Calls[i]
+		}
+		callItemID = pick(callItemID, "fc_")
 		if customTools[tc.Name] {
 			output = append(output, map[string]any{
-				"id":      "fc_" + strings.ReplaceAll(auth.NewUUID(), "-", ""),
+				"id":      callItemID,
 				"type":    "custom_tool_call",
 				"status":  "completed",
 				"call_id": tc.ID,
@@ -396,13 +442,17 @@ func buildResponsesObject(respID string, created int64, model, status string, re
 				"input":   extractCustomToolInput(tc.Arguments),
 			})
 		} else {
+			args := strings.TrimSpace(tc.Arguments)
+			if args == "" {
+				args = "{}"
+			}
 			output = append(output, map[string]any{
-				"id":        "fc_" + strings.ReplaceAll(auth.NewUUID(), "-", ""),
+				"id":        callItemID,
 				"type":      "function_call",
 				"status":    "completed",
 				"call_id":   tc.ID,
 				"name":      tc.Name,
-				"arguments": tc.Arguments,
+				"arguments": args,
 			})
 		}
 	}
@@ -440,9 +490,79 @@ func extractCustomToolInput(argsJSON string) string {
 	return argsJSON
 }
 
+// customToolInputString converts a custom_tool_call "input" value to its raw string
+// form without turning a missing/null value into the literal "<nil>".
+func customToolInputString(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	default:
+		b, err := json.Marshal(x)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	}
+}
+
+// appendAssistantToolCall attaches a tool call to the preceding assistant message when
+// there is one, so a single assistant turn (text + N parallel calls) stays one message.
+// Splitting it into several assistant messages breaks thread-history matching upstream.
+func appendAssistantToolCall(msgs []map[string]any, call map[string]any) []map[string]any {
+	if n := len(msgs); n > 0 {
+		last := msgs[n-1]
+		if role, _ := last["role"].(string); role == "assistant" {
+			calls, _ := last["tool_calls"].([]any)
+			last["tool_calls"] = append(calls, call)
+			return msgs
+		}
+	}
+	return append(msgs, map[string]any{
+		"role":       "assistant",
+		"tool_calls": []any{call},
+	})
+}
+
+// responsesTextFormat maps the Responses API `text.format` object onto the Chat
+// Completions `response_format` shape understood by the upstream tool bridge.
+func responsesTextFormat(body map[string]any) any {
+	textObj, ok := body["text"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	f, ok := textObj["format"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	typ, _ := f["type"].(string)
+	switch typ {
+	case "json_object":
+		return map[string]any{"type": "json_object"}
+	case "json_schema":
+		js := map[string]any{}
+		for _, k := range []string{"name", "schema", "strict", "description"} {
+			if v, ok := f[k]; ok && v != nil {
+				js[k] = v
+			}
+		}
+		return map[string]any{"type": "json_schema", "json_schema": js}
+	default:
+		return nil
+	}
+}
+
 func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.ChatRequest, map[string]bool, error) {
 	reqModel, _ := body["model"].(string)
 	var msgs []map[string]any
+
+	// This gateway is stateless: it does not persist response objects, so a
+	// previous_response_id cannot be resolved. Fail loudly instead of silently
+	// answering without the referenced context.
+	if prev, ok := body["previous_response_id"].(string); ok && strings.TrimSpace(prev) != "" {
+		return upstream.ChatRequest{}, nil, fmt.Errorf("previous_response_id is not supported by this gateway; resend the full conversation in input (store=false)")
+	}
 
 	if inst, ok := body["instructions"].(string); ok && strings.TrimSpace(inst) != "" {
 		msgs = append(msgs, map[string]any{
@@ -473,17 +593,12 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 					callID, _ = item["id"].(string)
 				}
 				name, _ := item["name"].(string)
-				msgs = append(msgs, map[string]any{
-					"role": "assistant",
-					"tool_calls": []any{
-						map[string]any{
-							"id":   callID,
-							"type": "function",
-							"function": map[string]any{
-								"name":      name,
-								"arguments": upstream.ArgumentString(item["arguments"]),
-							},
-						},
+				msgs = appendAssistantToolCall(msgs, map[string]any{
+					"id":   callID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      name,
+						"arguments": upstream.ArgumentString(item["arguments"]),
 					},
 				})
 			case "custom_tool_call":
@@ -492,18 +607,13 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 					callID, _ = item["id"].(string)
 				}
 				name, _ := item["name"].(string)
-				argsJSON, _ := json.Marshal(map[string]any{"input": fmt.Sprint(item["input"])})
-				msgs = append(msgs, map[string]any{
-					"role": "assistant",
-					"tool_calls": []any{
-						map[string]any{
-							"id":   callID,
-							"type": "function",
-							"function": map[string]any{
-								"name":      name,
-								"arguments": string(argsJSON),
-							},
-						},
+				argsJSON, _ := json.Marshal(map[string]any{"input": customToolInputString(item["input"])})
+				msgs = appendAssistantToolCall(msgs, map[string]any{
+					"id":   callID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      name,
+						"arguments": string(argsJSON),
 					},
 				})
 			case "function_call_output", "custom_tool_call_output":
@@ -515,7 +625,7 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 				})
 			case "reasoning":
 				continue
-			default:
+			case "", "message":
 				role, _ := item["role"].(string)
 				if strings.TrimSpace(role) == "" {
 					role = "user"
@@ -523,6 +633,25 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 				msgs = append(msgs, map[string]any{
 					"role":    strings.ToLower(strings.TrimSpace(role)),
 					"content": convertResponsesContent(item["content"]),
+				})
+			default:
+				// Ignore unknown non-message input item types (e.g. item_reference, web_search_call)
+				// unless they explicitly carry non-empty message content.
+				rawContent, hasContent := item["content"]
+				if !hasContent {
+					continue
+				}
+				content := convertResponsesContent(rawContent)
+				if s, ok := content.(string); ok && strings.TrimSpace(s) == "" {
+					continue
+				}
+				role, _ := item["role"].(string)
+				if strings.TrimSpace(role) == "" {
+					role = "user"
+				}
+				msgs = append(msgs, map[string]any{
+					"role":    strings.ToLower(strings.TrimSpace(role)),
+					"content": content,
 				})
 			}
 		}
@@ -622,6 +751,7 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 		Tools:             oaTools,
 		ToolChoice:        toolChoice,
 		ParallelToolCalls: parallelPtr,
+		ResponseFormat:    responsesTextFormat(body),
 		ConversationID:    convID,
 	}, customTools, nil
 }

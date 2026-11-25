@@ -49,14 +49,10 @@ func isAutostartEnabledInKey(subKey, valueName, exePath, configPath string) bool
 	if err != nil || strings.TrimSpace(val) == "" {
 		return false
 	}
-	want := buildAutostartCommand(exePath, configPath)
-	if strings.EqualFold(strings.TrimSpace(val), want) {
-		return true
-	}
-	if absExe, err := filepath.Abs(exePath); err == nil && absExe != "" {
-		return strings.Contains(strings.ToLower(val), strings.ToLower(absExe))
-	}
-	return false
+	// Exact match only (case-insensitive, as Windows paths are). A substring check
+	// would report another install (e.g. "awsquick2api.exe.bak" or a different
+	// -config) as enabled for this one.
+	return strings.EqualFold(strings.TrimSpace(val), buildAutostartCommand(exePath, configPath))
 }
 
 func setAutostartEnabledInKey(subKey, valueName, exePath, configPath string, enabled bool) error {

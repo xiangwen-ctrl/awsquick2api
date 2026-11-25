@@ -163,13 +163,15 @@ func (d *EventStreamDecoder) Feed(chunk []byte) ([]EventStreamMessage, error) {
 	var msgs []EventStreamMessage
 	pos := 0
 	for len(d.buf)-pos >= 12 {
-		total := int(binary.BigEndian.Uint32(d.buf[pos : pos+4]))
-		headersLen := int(binary.BigEndian.Uint32(d.buf[pos+4 : pos+8]))
+		totalU32 := binary.BigEndian.Uint32(d.buf[pos : pos+4])
+		headersU32 := binary.BigEndian.Uint32(d.buf[pos+4 : pos+8])
 		preludeCRC := binary.BigEndian.Uint32(d.buf[pos+8 : pos+12])
-		if total < 16 || total > maxEventStreamFrame || headersLen > total-16 {
+		if totalU32 < 16 || totalU32 > maxEventStreamFrame || headersU32 > totalU32-16 {
 			d.buf = nil
-			return nil, fmt.Errorf("invalid event-stream lengths (total=%d headers=%d)", total, headersLen)
+			return nil, fmt.Errorf("invalid event-stream lengths (total=%d headers=%d)", totalU32, headersU32)
 		}
+		total := int(totalU32)
+		headersLen := int(headersU32)
 		if crc32.ChecksumIEEE(d.buf[pos:pos+8]) != preludeCRC {
 			d.buf = nil
 			return nil, errors.New("event-stream prelude CRC mismatch")
@@ -396,6 +398,121 @@ func cborDecodeAt(data []byte, start int, depth int) (any, int, error) {
 		}
 		n = binary.BigEndian.Uint64(data[i : i+8])
 		i += 8
+	case info == 31:
+		// RFC 8949 indefinite-length byte string, text string, array, or map (bounded).
+		switch major {
+		case 2:
+			var out []byte
+			chunks := 0
+			for {
+				if i >= len(data) {
+					return nil, i, errors.New("truncated CBOR indefinite bytes")
+				}
+				if data[i] == 0xff {
+					return out, i + 1, nil
+				}
+				chunks++
+				if chunks > 65536 {
+					return nil, i, errors.New("CBOR indefinite bytes too many chunks")
+				}
+				part, next, err := cborDecodeAt(data, i, depth+1)
+				if err != nil {
+					return nil, i, err
+				}
+				pb, ok := part.([]byte)
+				if !ok {
+					return nil, i, errors.New("CBOR indefinite bytes chunk is not bytes")
+				}
+				if len(out)+len(pb) > maxEventStreamFrame {
+					return nil, i, errors.New("CBOR bytes too large")
+				}
+				out = append(out, pb...)
+				i = next
+			}
+		case 3:
+			var sb strings.Builder
+			chunks := 0
+			for {
+				if i >= len(data) {
+					return nil, i, errors.New("truncated CBOR indefinite text")
+				}
+				if data[i] == 0xff {
+					return sb.String(), i + 1, nil
+				}
+				chunks++
+				if chunks > 65536 {
+					return nil, i, errors.New("CBOR indefinite text too many chunks")
+				}
+				part, next, err := cborDecodeAt(data, i, depth+1)
+				if err != nil {
+					return nil, i, err
+				}
+				ps, ok := part.(string)
+				if !ok {
+					return nil, i, errors.New("CBOR indefinite text chunk is not text")
+				}
+				if sb.Len()+len(ps) > maxEventStreamFrame {
+					return nil, i, errors.New("CBOR text too large")
+				}
+				sb.WriteString(ps)
+				i = next
+			}
+		case 4:
+			var arr []any
+			for {
+				if i >= len(data) {
+					return nil, i, errors.New("truncated CBOR indefinite array")
+				}
+				if data[i] == 0xff {
+					return arr, i + 1, nil
+				}
+				if len(arr) >= 65536 {
+					return nil, i, errors.New("CBOR array too large")
+				}
+				item, next, err := cborDecodeAt(data, i, depth+1)
+				if err != nil {
+					return nil, i, err
+				}
+				arr = append(arr, item)
+				i = next
+			}
+		case 5:
+			m := map[string]any{}
+			entries := 0
+			for {
+				if i >= len(data) {
+					return nil, i, errors.New("truncated CBOR indefinite map")
+				}
+				if data[i] == 0xff {
+					return m, i + 1, nil
+				}
+				if entries >= 65536 {
+					return nil, i, errors.New("CBOR map too large")
+				}
+				entries++
+				key, afterKey, err := cborDecodeAt(data, i, depth+1)
+				if err != nil {
+					return nil, i, err
+				}
+				val, afterVal, err := cborDecodeAt(data, afterKey, depth+1)
+				if err != nil {
+					return nil, afterKey, err
+				}
+				var ks string
+				switch kt := key.(type) {
+				case string:
+					ks = kt
+				case []byte:
+					ks = string(kt)
+				default:
+					ks = fmt.Sprint(kt)
+				}
+				m[ks] = val
+				i = afterVal
+			}
+		default:
+			return nil, i, fmt.Errorf("unsupported CBOR indefinite major type %d", major)
+		}
 	default:
 		return nil, i, fmt.Errorf("unsupported CBOR additional info %d", info)
 	}
@@ -424,7 +541,10 @@ func cborDecodeAt(data []byte, start int, depth int) (any, int, error) {
 		}
 		return string(data[i : i+int(n)]), i + int(n), nil
 	case 4:
-		if n > 65536 {
+		// Every element needs at least one byte, so a declared length larger than
+		// the remaining input is malformed; rejecting it up front stops tiny
+		// frames from forcing huge pre-allocations at every nesting level.
+		if n > 65536 || n > uint64(len(data)-i) {
 			return nil, i, errors.New("CBOR array too large")
 		}
 		arr := make([]any, 0, n)
@@ -438,7 +558,8 @@ func cborDecodeAt(data []byte, start int, depth int) (any, int, error) {
 		}
 		return arr, i, nil
 	case 5:
-		if n > 65536 {
+		// Each key/value pair needs at least two bytes.
+		if n > 65536 || n > uint64(len(data)-i)/2 {
 			return nil, i, errors.New("CBOR map too large")
 		}
 		m := make(map[string]any, n)

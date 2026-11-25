@@ -70,17 +70,42 @@ var (
 		"mp4": true, "webm": true, "mp3": true, "wav": true, "pdf": true, "zip": true, "gz": true, "tar": true,
 		"go": true, "py": true, "rs": true, "java": true, "rb": true, "php": true, "c": true, "cpp": true, "h": true,
 		"html": true, "htm": true, "md": true, "txt": true, "yaml": true, "yml": true, "toml": true, "lock": true,
+		"tgz": true, "whl": true, "exe": true, "dll": true, "wasm": true, "xml": true, "csv": true,
+		"log": true, "bin": true, "sql": true, "proto": true, "vue": true, "scss": true, "less": true, "kt": true,
+		"swift": true, "dart": true, "lua": true, "ini": true, "cfg": true, "conf": true, "ps1": true, "bat": true,
 	}
 
-	emailStdRE     = regexp.MustCompile(`(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,24}`)
-	emailObfRE     = regexp.MustCompile(`(?i)\b([a-z0-9._%+\-]+)\s*(?:\[at\]|\(at\)|\{at\}|\bat\b)\s*([a-z0-9.\-]+(?:\s*(?:\.|\[dot\]|\(dot\)|\{dot\}|\bdot\b)\s*[a-z0-9\-]+)*)\s*(?:\.|\[dot\]|\(dot\)|\{dot\}|\bdot\b)\s*([a-z]{2,24})\b`)
+	// systemd unit suffixes ("getty@tty1.service", "user@1000.slice") are never emails.
+	systemdUnitExts = map[string]bool{
+		"service": true, "socket": true, "timer": true, "target": true, "mount": true, "automount": true,
+		"slice": true, "scope": true, "swap": true, "device": true,
+	}
+
+	// uriUserinfoSchemes lists URI schemes whose "user[:pass]@host" userinfo is not an email.
+	uriUserinfoSchemes = map[string]bool{
+		"postgres": true, "postgresql": true, "mysql": true, "mariadb": true, "mongodb": true, "mongodb+srv": true,
+		"redis": true, "rediss": true, "amqp": true, "amqps": true, "ssh": true, "git": true, "git+ssh": true,
+		"ftp": true, "ftps": true, "sftp": true, "smb": true, "ldap": true, "ldaps": true, "sqlserver": true,
+		"mssql": true, "clickhouse": true, "nats": true, "kafka": true, "svn": true, "svn+ssh": true,
+		"oracle": true, "cockroachdb": true,
+	}
+
+	emailStdRE = regexp.MustCompile(`(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,24}`)
+	emailObfRE = regexp.MustCompile(`(?i)\b([a-z0-9._%+\-]+)\s*(?:\[at\]|\(at\)|\{at\})\s*([a-z0-9][a-z0-9.\-]*(?:\s*(?:\.|\[dot\]|\(dot\)|\{dot\}|\bdot\b)\s*[a-z0-9\-]+)*)\s*(?:\.|\[dot\]|\(dot\)|\{dot\}|\bdot\b)\s*([a-z]{2,24})\b`)
+	// emailObfBareRE accepts a bare "at" only when the final separator is an
+	// explicit dot marker ([dot]/(dot)/{dot}/dot); the TLD must also be in
+	// obfEmailTLDs. Plain "word at ident.Field" prose/code never matches.
+	emailObfBareRE = regexp.MustCompile(`(?i)\b([a-z0-9._%+\-]+)\s+at\s+([a-z0-9\-]+(?:(?:\.|\s*(?:\[dot\]|\(dot\)|\{dot\}|\bdot\b)\s*)[a-z0-9\-]+)*)\s*(?:\[dot\]|\(dot\)|\{dot\}|\bdot\b)\s*([a-z]{2,24})\b`)
 	obfDotSplitRE  = regexp.MustCompile(`(?i)\s*(?:\.|\[dot\]|\(dot\)|\{dot\}|\bdot\b)\s*`)
-	sepHexRE       = regexp.MustCompile(`(?:0x|\\x)?[0-9a-fA-F]{2}(?:(?:[\s,:\-]|\\x|0x)+[0-9a-fA-F]{2}){4,}`)
-	contigHexRE    = regexp.MustCompile(`\b[0-9a-fA-F]{10,}\b`)
-	mixedEscSpanRE = regexp.MustCompile(`(?:\\u[0-9a-fA-F]{4}|\\U[0-9a-fA-F]{8}|%[0-9a-fA-F]{2}|&#x[0-9a-fA-F]{1,6};|&#[0-9]{2,6};|[A-Za-z0-9.@_\-+]){6,}`)
+	sepHexRE       = regexp.MustCompile(`(?:0[xX]|\\[xX])?[0-9a-fA-F]{2}(?:(?:[\s,:\-]|\\[xX]|0[xX])+[0-9a-fA-F]{2}){4,}`)
+	contigHexRE    = regexp.MustCompile(`\b(?:0[xX])?[0-9a-fA-F]{10,}\b`)
+	mixedEscSpanRE = regexp.MustCompile(`(?:\\u[0-9a-fA-F]{4}|\\U[0-9a-fA-F]{8}|%[0-9a-fA-F]{2}|&#[xX][0-9a-fA-F]{1,6};|&#[0-9]{2,6};|[A-Za-z0-9.@_\-+]){2,}`)
 	unicodeEsc4RE  = regexp.MustCompile(`\\u([0-9a-fA-F]{4})`)
 	unicodeEsc8RE  = regexp.MustCompile(`\\U([0-9a-fA-F]{8})`)
-	base64TokenRE  = regexp.MustCompile(`[A-Za-z0-9+/=_\-]{8,}`)
+	base64TokenRE  = regexp.MustCompile(`[A-Za-z0-9+/_\-]{6,}={0,2}`)
+	// obfEmailPrefixTailRE detects an in-progress obfuscated email at the tail of the
+	// streaming buffer so its leading half is not flushed before the domain/TLD arrives.
+	obfEmailPrefixTailRE = regexp.MustCompile(`(?i)\b[a-z0-9._%+\-]+\s*(?:(?:\[at\]|\(at\)|\{at\}|\bat\b)(?:\s*[a-z0-9.\-]+(?:\s*(?:\.|\[dot\]|\(dot\)|\{dot\}|\bdot\b)\s*[a-z0-9.\-]+)*)?(?:\s*(?:\.|\[dot\]|\(dot\)|\{dot\}|\bdot\b|\[(?:d|do|dot)?|\((?:d|do|dot)?|\{(?:d|do|dot)?)|\s+(?:d|do))?|\[(?:a|at)?|\((?:a|at)?|\{(?:a|at)?)\s*$`)
 )
 
 type literalTarget struct {
@@ -190,7 +215,7 @@ func buildAccountPrivacyPolicy(acct *auth.Account, messages []map[string]any, st
 			addSkeleton(sec)
 			if utf8.RuneCountInString(sec) >= 5 {
 				rev := reverseRunesStr(sec)
-				if !strings.Contains(inputLower, strings.ToLower(rev)) {
+				if !containsWordBounded(inputLower, strings.ToLower(rev)) {
 					addLiteral(rev)
 					addSkeleton(rev)
 				}
@@ -201,7 +226,7 @@ func buildAccountPrivacyPolicy(acct *auth.Account, messages []map[string]any, st
 	// Add spoken/bracketed email skeleton variant (e.g., "alice [at] gmail [dot] com" -> "aliceatgmaildotcom").
 	if strict && acct.Email != "" {
 		em := strings.ToLower(strings.TrimSpace(acct.Email))
-		if !strings.Contains(inputLower, em) && strings.Contains(em, "@") {
+		if !containsWordBounded(inputLower, em) && strings.Contains(em, "@") {
 			spoken := strings.ReplaceAll(strings.ReplaceAll(em, "@", "at"), ".", "dot")
 			addSkeleton(spoken)
 		}
@@ -236,6 +261,8 @@ func collectRawAccountSecrets(acct *auth.Account, inputLower string) []string {
 		{acct.DisplayNameVal, 2},
 		{acct.UserName, 3},
 		{acct.AccountName, 4},
+		{acct.AccountID, 4},
+		{acct.Namespace, 4},
 	}
 	seen := map[string]bool{}
 	var out []string
@@ -245,7 +272,9 @@ func collectRawAccountSecrets(acct *auth.Account, inputLower string) []string {
 			return
 		}
 		low := strings.ToLower(s)
-		if genericPrivacyWords[low] || seen[low] || strings.Contains(inputLower, low) {
+		// Exempt only when the user typed the value as a standalone word: "malice"
+		// must not exempt "alice", nor "markdown" exempt "mark".
+		if genericPrivacyWords[low] || low == "default" || seen[low] || containsWordBounded(inputLower, low) {
 			return
 		}
 		seen[low] = true
@@ -446,28 +475,64 @@ func validSkeletonSpan(sRunes []rune, pos []int, requireBound bool) bool {
 
 func (p *accountPrivacyPolicy) scrubUnauthorizedEmails(text string) string {
 	if strings.Contains(text, "@") {
-		text = emailStdRE.ReplaceAllStringFunc(text, func(m string) string {
-			if p.isEmailAllowed(m) {
-				return m
+		if locs := emailStdRE.FindAllStringIndex(text, -1); len(locs) > 0 {
+			var sb strings.Builder
+			sb.Grow(len(text))
+			last := 0
+			for _, loc := range locs {
+				m := text[loc[0]:loc[1]]
+				sb.WriteString(text[last:loc[0]])
+				if p.isEmailAllowed(m) || isURIUserinfo(text, loc[0]) {
+					sb.WriteString(m)
+				} else {
+					sb.WriteString(redactedMarker)
+				}
+				last = loc[1]
 			}
-			return redactedMarker
-		})
+			sb.WriteString(text[last:])
+			text = sb.String()
+		}
 	}
 	if containsFoldSubstr(text, "at") {
 		text = emailObfRE.ReplaceAllStringFunc(text, func(m string) string {
-			sub := emailObfRE.FindStringSubmatch(m)
-			if len(sub) != 4 {
-				return m
-			}
-			normDom := obfDotSplitRE.ReplaceAllString(strings.TrimSpace(sub[2]), ".")
-			normEmail := strings.TrimSpace(sub[1]) + "@" + normDom + "." + strings.TrimSpace(sub[3])
-			if p.isEmailAllowed(normEmail) {
-				return m
-			}
-			return redactedMarker
+			return p.redactObfEmail(emailObfRE, m, false)
+		})
+		text = emailObfBareRE.ReplaceAllStringFunc(text, func(m string) string {
+			return p.redactObfEmail(emailObfBareRE, m, true)
 		})
 	}
 	return text
+}
+
+// obfEmailTLDs is the TLD allowlist required by emailObfBareRE matches.
+var obfEmailTLDs = map[string]bool{
+	"com": true, "net": true, "org": true, "edu": true, "gov": true, "mil": true,
+	"io": true, "co": true, "cn": true, "uk": true, "de": true, "jp": true,
+	"fr": true, "ru": true, "kr": true, "hk": true, "tw": true, "sg": true,
+	"us": true, "ca": true, "au": true, "in": true, "eu": true, "nl": true,
+	"ch": true, "se": true, "no": true, "es": true, "it": true, "br": true,
+	"mx": true, "me": true, "info": true, "biz": true, "dev": true, "app": true,
+	"ai": true, "xyz": true, "cc": true, "tv": true, "top": true, "tech": true,
+	"site": true, "online": true, "cloud": true, "email": true, "mail": true,
+}
+
+// redactObfEmail normalises an obfuscated-email match and redacts it unless
+// the de-obfuscated address is allowed. requireKnownTLD gates bare-"at" hits.
+func (p *accountPrivacyPolicy) redactObfEmail(re *regexp.Regexp, m string, requireKnownTLD bool) string {
+	sub := re.FindStringSubmatch(m)
+	if len(sub) != 4 {
+		return m
+	}
+	tld := strings.ToLower(strings.TrimSpace(sub[3]))
+	if requireKnownTLD && !obfEmailTLDs[tld] {
+		return m
+	}
+	normDom := obfDotSplitRE.ReplaceAllString(strings.TrimSpace(sub[2]), ".")
+	normEmail := strings.TrimSpace(sub[1]) + "@" + normDom + "." + tld
+	if p.isEmailAllowed(normEmail) {
+		return m
+	}
+	return redactedMarker
 }
 
 func (p *accountPrivacyPolicy) isEmailAllowed(rawEmail string) bool {
@@ -484,16 +549,24 @@ func (p *accountPrivacyPolicy) isEmailAllowed(rawEmail string) bool {
 		return true
 	}
 	// Ignore asset/file names like "logo@2x.png" or "module@v1.json".
+	// Also multi-segment names ("jquery@3.6.0.min.js", "icon@2x.min.png") and
+	// systemd units ("getty@tty1.service").
 	if dotIdx := strings.LastIndexByte(domain, '.'); dotIdx > 0 {
 		tld := domain[dotIdx+1:]
-		if nonEmailFileExts[tld] && strings.Count(domain, ".") == 1 {
+		if systemdUnitExts[tld] {
 			return true
+		}
+		if nonEmailFileExts[tld] {
+			first, _, _ := strings.Cut(domain, ".")
+			if strings.Count(domain, ".") == 1 || looksLikeVersionLabel(first) {
+				return true
+			}
 		}
 	}
 	if local == "noreply" || local == "no-reply" || local == "donotreply" {
 		return true
 	}
-	if local == "git" && (domain == "github.com" || domain == "gitlab.com") {
+	if local == "git" && gitSSHHosts[domain] {
 		return true
 	}
 	if safePlaceholderEmailDomains[domain] {
@@ -511,7 +584,8 @@ func (p *accountPrivacyPolicy) scrubEncodedSpans(text string, depth int) string 
 	// 1. Mixed Unicode (\uXXXX / \UXXXXXXXX), URL (%XX), and HTML (&#...;) escape sequences.
 	if strings.Contains(text, `\u`) || strings.Contains(text, `\U`) || strings.Contains(text, "%") || strings.Contains(text, "&#") {
 		text = mixedEscSpanRE.ReplaceAllStringFunc(text, func(span string) string {
-			if countEscapeMarkers(span) < 2 {
+			// A single escape is enough: "wang%40corp.com" must be decoded too.
+			if countEscapeMarkers(span) < 1 {
 				return span
 			}
 			decoded := decodeEscapedSpan(span)
@@ -530,12 +604,16 @@ func (p *accountPrivacyPolicy) scrubEncodedSpans(text string, depth int) string 
 		return span
 	})
 
-	// 3. Contiguous hex runs.
+	// 3. Contiguous hex runs (including optional 0x/0X prefix).
 	text = contigHexRE.ReplaceAllStringFunc(text, func(span string) string {
-		if len(span) > 2048 || len(span)%2 != 0 {
+		rawHex := span
+		if strings.HasPrefix(rawHex, "0x") || strings.HasPrefix(rawHex, "0X") {
+			rawHex = rawHex[2:]
+		}
+		if len(rawHex) > 2048 || len(rawHex)%2 != 0 {
 			return span
 		}
-		b, err := hex.DecodeString(span)
+		b, err := hex.DecodeString(rawHex)
 		if err == nil && len(b) >= 5 {
 			raw := string(b)
 			if isMostlyPrintableUTF8(raw) && p.containsSensitive(raw, depth) {
@@ -648,6 +726,16 @@ func isMostlyPrintableUTF8(s string) bool {
 			printable++
 		}
 	}
+	// Two-rune CJK payloads (e.g. a 2-character Chinese name) are legitimate
+	// decode targets; require both runes to be non-ASCII letters.
+	if total == 2 && printable == 2 {
+		for _, r := range s {
+			if r < 128 || !unicode.IsLetter(r) {
+				return false
+			}
+		}
+		return true
+	}
 	return total >= 3 && printable*10 >= total*9
 }
 
@@ -657,7 +745,7 @@ func replaceFoldLiteralBounded(s, target, repl string, requireBound bool) string
 	}
 	lowS := strings.ToLower(s)
 	lowT := strings.ToLower(target)
-	if !strings.Contains(lowS, lowT) {
+	if !strings.Contains(lowS, lowT) && !hasFullwidthASCII(s) {
 		return s
 	}
 	sRunes := []rune(s)
@@ -682,10 +770,10 @@ func replaceFoldLiteralBounded(s, target, repl string, requireBound bool) string
 		if i+len(tRunes) <= len(sRunes) && runesEqual(lowRunes[i:i+len(tRunes)], tRunes) {
 			boundOK := true
 			if requireBound {
-				if i > 0 && isASCIIAlphaNum(sRunes[i-1]) {
+				if i > 0 && isASCIIAlphaNum(lowRunes[i-1]) {
 					boundOK = false
 				}
-				if i+len(tRunes) < len(sRunes) && isASCIIAlphaNum(sRunes[i+len(tRunes)]) {
+				if i+len(tRunes) < len(sRunes) && isASCIIAlphaNum(lowRunes[i+len(tRunes)]) {
 					boundOK = false
 				}
 			}
@@ -729,6 +817,99 @@ func isPureASCIIAlphaNum(s string) bool {
 	return true
 }
 
+// gitSSHHosts are forges whose "git@host" SSH address is not personal PII.
+var gitSSHHosts = map[string]bool{
+	"github.com": true, "gitlab.com": true, "gitee.com": true, "bitbucket.org": true,
+	"codeberg.org": true, "ssh.dev.azure.com": true, "git.sr.ht": true,
+}
+
+func isWordRune(r rune) bool {
+	return isASCIIAlphaNum(r) || r == '_'
+}
+
+// containsWordBounded reports whether needle occurs in hay (both already
+// lower-cased) with no ASCII word rune glued to an ASCII-word edge of needle.
+// CJK edges need no boundary, as CJK text has no word separators.
+func containsWordBounded(hay, needle string) bool {
+	if needle == "" || len(hay) < len(needle) {
+		return false
+	}
+	first, _ := utf8.DecodeRuneInString(needle)
+	lastR, _ := utf8.DecodeLastRuneInString(needle)
+	leftB, rightB := isWordRune(first), isWordRune(lastR)
+	for off := 0; off <= len(hay)-len(needle); {
+		i := strings.Index(hay[off:], needle)
+		if i < 0 {
+			return false
+		}
+		i += off
+		ok := true
+		if leftB && i > 0 {
+			if r, _ := utf8.DecodeLastRuneInString(hay[:i]); isWordRune(r) {
+				ok = false
+			}
+		}
+		if end := i + len(needle); ok && rightB && end < len(hay) {
+			if r, _ := utf8.DecodeRuneInString(hay[end:]); isWordRune(r) {
+				ok = false
+			}
+		}
+		if ok {
+			return true
+		}
+		_, sz := utf8.DecodeRuneInString(hay[i:])
+		off = i + sz
+	}
+	return false
+}
+
+// isURIUserinfo reports whether the email-like match starting at start is the
+// userinfo of a known-scheme URI, e.g. "postgres://user:pass@db.internal".
+func isURIUserinfo(text string, start int) bool {
+	j := start
+	for j > 0 && start-j < 512 {
+		c := text[j-1]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '"' || c == '\'' || c == '`' || c == '<' || c == '(' || c == '=' {
+			break
+		}
+		j--
+	}
+	prefix := text[j:start]
+	idx := strings.LastIndex(prefix, "://")
+	if idx <= 0 || strings.ContainsAny(prefix[idx+3:], "/?#&=@") {
+		return false
+	}
+	scheme := strings.ToLower(prefix[:idx])
+	if k := strings.LastIndexByte(scheme, ':'); k >= 0 { // "jdbc:postgresql"
+		scheme = scheme[k+1:]
+	}
+	return uriUserinfoSchemes[scheme]
+}
+
+// looksLikeVersionLabel matches "2x", "3", "v1" style leading labels of asset names.
+func looksLikeVersionLabel(s string) bool {
+	if s == "" {
+		return false
+	}
+	if s[0] >= '0' && s[0] <= '9' {
+		return true
+	}
+	return len(s) >= 2 && (s[0] == 'v' || s[0] == 'V') && s[1] >= '0' && s[1] <= '9'
+}
+
+// hasFullwidthASCII reports whether s contains a full-width ASCII homoglyph.
+func hasFullwidthASCII(s string) bool {
+	if strings.IndexByte(s, 0xEF) < 0 {
+		return false
+	}
+	for _, r := range s {
+		if r >= 0xFF01 && r <= 0xFF5E {
+			return true
+		}
+	}
+	return false
+}
+
 func isPureASCIIRunes(rs []rune) bool {
 	for _, r := range rs {
 		if r >= 128 {
@@ -763,6 +944,14 @@ func foldRuneLower(r rune) rune {
 	if r < 128 {
 		return r
 	}
+	// Fold full-width ASCII homoglyphs (U+FF01..U+FF5E) to ASCII.
+	if r >= 0xFF01 && r <= 0xFF5E {
+		r -= 0xFEE0
+		if r >= 'A' && r <= 'Z' {
+			r += 'a' - 'A'
+		}
+		return r
+	}
 	low := strings.ToLower(string(r))
 	if first, _ := utf8.DecodeRuneInString(low); first != utf8.RuneError {
 		return first
@@ -785,6 +974,13 @@ func runesEqual(a, b []rune) bool {
 const (
 	defaultStreamBaseTail = 48
 	maxStreamHoldRunes    = 256
+	// strictStreamHoldRunes lets strict mode keep a whole contiguous token
+	// (base64/hex/URL; scrubEncodedSpans decodes up to 2048 chars) buffered so
+	// streamed redaction matches one-shot Scrub.
+	strictStreamHoldRunes = 2048 + 64
+	// streamHardCapFactor bounds buffer growth when the straddle guard keeps
+	// deferring a cut inside a pathological, never-ending token.
+	streamHardCapFactor = 4
 )
 
 // privacyStreamRedactor buffers an adaptive raw sliding tail window so literal, split,
@@ -793,6 +989,7 @@ const (
 type privacyStreamRedactor struct {
 	policy        *accountPrivacyPolicy
 	baseTailRunes int
+	holdRunes     int
 	buf           string
 	emit          func(string)
 }
@@ -807,9 +1004,15 @@ func newPrivacyPolicyStreamRedactor(policy *accountPrivacyPolicy, emit func(stri
 			baseTail = defaultStreamBaseTail
 		}
 	}
+	hold := maxStreamHoldRunes
+	if policy != nil && policy.strict {
+		hold = strictStreamHoldRunes
+	}
+	hold = max(hold, 2*baseTail+16)
 	return &privacyStreamRedactor{
 		policy:        policy,
 		baseTailRunes: baseTail,
+		holdRunes:     hold,
 		emit:          emit,
 	}
 }
@@ -862,8 +1065,8 @@ func (r *privacyStreamRedactor) computeSafeFlushCount(runes []rune) int {
 	}
 	safeEnd := n - r.baseTailRunes
 	minSafeEnd := 0
-	if n > maxStreamHoldRunes {
-		minSafeEnd = n - maxStreamHoldRunes
+	if n > r.holdRunes {
+		minSafeEnd = n - r.holdRunes
 	}
 
 	if r.policy.strict {
@@ -876,8 +1079,8 @@ func (r *privacyStreamRedactor) computeSafeFlushCount(runes []rune) int {
 			safeEnd = tokStart
 		}
 
-		// 2. If the tail skeleton ends with a strict prefix of any secret skeleton
-		// (and has at most 10 trailing separator chars), hold from its first rune.
+		// 2. If the tail skeleton ends with a prefix (or complete match) of any secret
+		// skeleton (with valid <=10 rune gaps), hold from its first rune.
 		if len(r.policy.skeletons) > 0 {
 			tailSlice := runes[minSafeEnd:]
 			var tailSkel []rune
@@ -889,7 +1092,12 @@ func (r *privacyStreamRedactor) computeSafeFlushCount(runes []rune) int {
 				}
 			}
 			if len(tailSkel) > 0 && (n-1-tailOrig[len(tailOrig)-1]) <= 10 {
-				for sIdx := 0; sIdx < len(tailSkel); sIdx++ {
+				// Skeletons are sorted longest first; include full-length matches so
+				// a wide spaced skeleton that just completed is not cut in half.
+				for sIdx := max(0, len(tailSkel)-len(r.policy.skeletons[0].runes)); sIdx < len(tailSkel); sIdx++ {
+					if !skeletonSuffixGapsOK(tailOrig[sIdx:]) {
+						continue
+					}
 					suffix := tailSkel[sIdx:]
 					if r.matchesAnySkeletonPrefix(suffix) {
 						if origPos := tailOrig[sIdx]; origPos < safeEnd {
@@ -906,6 +1114,11 @@ func (r *privacyStreamRedactor) computeSafeFlushCount(runes []rune) int {
 			safeEnd = hexStart
 		}
 
+		// 4. Hold an ongoing obfuscated email at the end (e.g. "long.user [at] sub.corp ...").
+		if obfStart := trailingObfEmailStart(runes, minSafeEnd); obfStart < safeEnd {
+			safeEnd = obfStart
+		}
+
 		// Snap safeEnd left to avoid cutting inside a word/token.
 		for safeEnd > minSafeEnd && isTokenContinuationRune(runes[safeEnd-1]) {
 			safeEnd--
@@ -917,8 +1130,26 @@ func (r *privacyStreamRedactor) computeSafeFlushCount(runes []rune) int {
 	}
 
 	// Straddle guard: ensure splitting at safeEnd never bisects an already-complete match.
+	// It also runs for a forced cut at minSafeEnd inside an over-long token and may
+	// move below minSafeEnd (holding more is always safe); only past the hard cap
+	// is the forced cut accepted unchecked.
+	floor := 0
+	if n > r.holdRunes*streamHardCapFactor {
+		floor = minSafeEnd
+	}
 	winRadius := max(r.baseTailRunes, 48)
-	for safeEnd > minSafeEnd {
+	if r.policy.strict {
+		winRadius = max(winRadius, 256)
+		if len(r.policy.skeletons) > 0 {
+			// validSkeletonSpan allows up to 10 separator runes between adjacent skeleton runes.
+			maxSkelSpan := len(r.policy.skeletons[0].runes) * 11
+			winRadius = max(winRadius, maxSkelSpan)
+		}
+		if winRadius > r.holdRunes {
+			winRadius = r.holdRunes
+		}
+	}
+	for safeEnd > floor {
 		wStart := max(0, safeEnd-winRadius)
 		wEnd := min(n, safeEnd+winRadius)
 		left := string(runes[wStart:safeEnd])
@@ -927,7 +1158,7 @@ func (r *privacyStreamRedactor) computeSafeFlushCount(runes []rune) int {
 		if r.policy.Scrub(whole) == r.policy.Scrub(left)+r.policy.Scrub(right) {
 			break
 		}
-		safeEnd = max(minSafeEnd, safeEnd-16)
+		safeEnd = max(floor, safeEnd-16)
 		for safeEnd > minSafeEnd && isTokenContinuationRune(runes[safeEnd-1]) {
 			safeEnd--
 		}
@@ -940,11 +1171,34 @@ func (r *privacyStreamRedactor) matchesAnySkeletonPrefix(suffix []rune) bool {
 		return false
 	}
 	for _, tgt := range r.policy.skeletons {
-		if len(suffix) < len(tgt.runes) && runesEqual(tgt.runes[:len(suffix)], suffix) {
+		if len(suffix) <= len(tgt.runes) && runesEqual(tgt.runes[:len(suffix)], suffix) {
 			return true
 		}
 	}
 	return false
+}
+
+func skeletonSuffixGapsOK(orig []int) bool {
+	for i := 0; i < len(orig)-1; i++ {
+		if orig[i+1]-orig[i]-1 > 10 {
+			return false
+		}
+	}
+	return true
+}
+
+func trailingObfEmailStart(runes []rune, minIdx int) int {
+	const maxObfTailScan = 320
+	scanStart := max(minIdx, len(runes)-maxObfTailScan)
+	tail := string(runes[scanStart:])
+	if !containsFoldSubstr(tail, "at") && !strings.ContainsAny(tail, "[({") {
+		return len(runes)
+	}
+	loc := obfEmailPrefixTailRE.FindStringIndex(tail)
+	if loc == nil {
+		return len(runes)
+	}
+	return scanStart + utf8.RuneCountInString(tail[:loc[0]])
 }
 
 func isTokenContinuationRune(r rune) bool {

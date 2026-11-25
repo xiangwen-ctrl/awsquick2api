@@ -4,6 +4,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -256,7 +258,18 @@ func (h *Handler) runChatTurn(
 ) (*turnOutcome, *upstream.UpstreamError) {
 	snap := h.loadSnapshot()
 	cat := h.catalog()
-	slot, _, suffixEffort, _ := cat.Resolve(reqModel, snap.Upstream.DefaultModel, snap.ClaudeAliases)
+	slot, spec, suffixEffort, known := cat.Resolve(reqModel, snap.Upstream.DefaultModel, snap.ClaudeAliases)
+	if !modelPermitted(snap, cat, reqModel, slot, spec, suffixEffort, known) {
+		return nil, &upstream.UpstreamError{
+			Kind:       upstream.ErrKindInvalid,
+			StatusCode: http.StatusForbidden,
+			Code:       "model_not_allowed",
+			Message:    fmt.Sprintf("model %q is not allowed on this gateway", reqModel),
+		}
+	}
+	// The advanced tier is only served by accounts whose quota reports AdvancedEnabled;
+	// routing it to ordinary accounts would fail upstream and wrongly penalise them.
+	requireAdvanced := slot == "advanced"
 	req.Slot = slot
 	req.ThinkingEffort = upstream.ResolveThinkingEffort(snap.Thinking, reqModel, slot, suffixEffort, req.ThinkingEffort)
 	strictDLP := snap.StrictPrivacyDLP
@@ -332,18 +345,34 @@ func (h *Handler) runChatTurn(
 		if excluded[pref] {
 			pref = ""
 		}
-		lease, aerr := h.cfg.Pool.Acquire(ctx, pref, excluded, h.queueWaitTimeout(), h.maxQueue())
+		lease, aerr := h.cfg.Pool.AcquireWith(ctx, pool.AcquireOptions{
+			PreferredUID:    pref,
+			Exclude:         excluded,
+			WaitTimeout:     h.queueWaitTimeout(),
+			MaxWaiters:      h.maxQueue(),
+			RequireAdvanced: requireAdvanced,
+		})
 		if aerr != nil {
 			if ctx.Err() != nil {
 				return nil, &upstream.UpstreamError{StatusCode: 499, Code: "client_canceled", Message: "client canceled"}
 			}
 			status := http.StatusServiceUnavailable
 			code := "no_accounts_available"
-			if errors.Is(aerr, pool.ErrPoolBusy) {
+			switch {
+			case errors.Is(aerr, pool.ErrPoolBusy):
 				status = http.StatusTooManyRequests
 				code = "pool_busy"
+			case errors.Is(aerr, pool.ErrNoAdvancedAccounts) && lastErr == nil && !h.cfg.Pool.HasAdvancedAccount():
+				// Only a pool with no advanced-capable account at all is a client
+				// error. Advanced accounts that exist but are excluded, cooling down
+				// or circuit-broken keep the normal 503 (or lastErr after rotation).
+				status = http.StatusBadRequest
+				code = "model_not_available"
 			}
-			ue := &upstream.UpstreamError{StatusCode: status, Code: code, Message: aerr.Error()}
+			ue := &upstream.UpstreamError{StatusCode: status, Code: code, Message: reqlog.ScrubCredentials(aerr.Error())}
+			if code == "model_not_available" {
+				ue.Kind = upstream.ErrKindInvalid
+			}
 			if lastErr != nil {
 				ue = lastErr
 			}
@@ -351,163 +380,204 @@ func (h *Handler) runChatTurn(
 			return nil, ue
 		}
 
-		acct := lease.Account
-		lastAcct = acct
+		out, ue, rotate := func() (*turnOutcome, *upstream.UpstreamError, bool) {
+			// Every exit path of a single-account attempt (success, cancel, 401 refresh
+			// retry, empty-reply retry, rotation) must release the concurrency lease.
+			defer lease.Release()
+			acct := lease.Account
+			lastAcct = acct
 
-		// Proactive refresh if access token is within 2 minutes of expiring.
-		if h.cfg.Scheduler != nil && acct.NeedsRefresh(time.Now(), 2*time.Minute) {
-			if rerr := h.cfg.Scheduler.RefreshOneTokenIfStale(ctx, acct.UID, acct.AccessToken); rerr == nil {
-				if fresh := h.cfg.Pool.AuthByUID(acct.UID); fresh != nil {
-					acct = fresh
-				}
-			}
-		}
-
-		// Try up to 2 times on the same account when a 401 occurs before any output is emitted.
-		for authTry := 0; authTry < 2; authTry++ {
-			var (
-				commitMu     sync.Mutex
-				committed    bool
-				firstEventAt time.Time
-				waitTimer    *time.Timer
-			)
-			commitStream := func() {
-				commitMu.Lock()
-				if committed {
-					commitMu.Unlock()
-					return
-				}
-				committed = true
-				if waitTimer != nil {
-					waitTimer.Stop()
-				}
-				commitMu.Unlock()
-				if onStartStream != nil {
-					onStartStream(acct, reqID)
-				}
-			}
-
-			if req.Stream && onStartStream != nil && snap.Upstream.HeaderWaitSeconds > 0 {
-				waitTimer = time.AfterFunc(time.Duration(snap.Upstream.HeaderWaitSeconds)*time.Second, commitStream)
-			}
-
-			res, cerr := h.cfg.Upstream.Chat(ctx, acct, req, func(ev upstream.ChatEvent) {
-				commitMu.Lock()
-				if firstEventAt.IsZero() {
-					firstEventAt = time.Now()
-				}
-				commitMu.Unlock()
-				if req.Stream {
-					commitStream()
-					if onEvent != nil {
-						onEvent(ev)
-					}
-				}
-			})
-
-			commitMu.Lock()
-			if waitTimer != nil {
-				waitTimer.Stop()
-			}
-			wasCommitted := committed
-			firstAt := firstEventAt
-			commitMu.Unlock()
-
-			// Check for empty output (no text and no tool calls) before committing.
-			if cerr == nil && strings.TrimSpace(res.Text) == "" && len(res.ToolCalls) == 0 {
-				if snap.EmptyRetryEnabled && !wasCommitted && !emptyRetried {
-					emptyRetried = true
-					log.Printf("[server] empty reply from acct=%s slot=%s; retrying once", acct.UID, slot)
-					continue
-				}
-				cerr = (&upstream.UpstreamError{
-					Kind:       upstream.ErrKindUpstream,
-					StatusCode: http.StatusBadGateway,
-					Code:       "upstream_empty_response",
-					Message:    "Amazon Quick returned an empty response with no text or tool calls",
-				}).Normalize()
-			}
-
-			if cerr == nil {
-				lease.Release()
-				h.cfg.Pool.MarkSuccess(acct.UID, res.Usage.TotalTokens)
-				if h.cfg.Session != nil && sessKey != "" {
-					h.cfg.Session.Bind(sessKey, acct.UID, req.ConversationID)
-				}
-				if req.Stream && !wasCommitted && onStartStream != nil {
-					commitStream()
-				}
-				out := &turnOutcome{
-					ReqID:        reqID,
-					Start:        start,
-					FirstEventAt: firstAt,
-					Account:      acct,
-					Slot:         slot,
-					Result:       res,
-					EmptyRetried: emptyRetried,
-				}
-				recordResult(acct, http.StatusOK, "", "", out)
-				return out, nil
-			}
-
-			// Client disconnect / cancel.
-			if ctx.Err() != nil {
-				lease.Release()
-				recordResult(acct, 499, "client_canceled", "client canceled", nil)
-				return nil, &upstream.UpstreamError{StatusCode: 499, Code: "client_canceled", Message: "client canceled"}
-			}
-
-			var ue *upstream.UpstreamError
-			if !errors.As(cerr, &ue) {
-				ue = (&upstream.UpstreamError{Kind: upstream.ErrKindUpstream, StatusCode: http.StatusBadGateway, Message: cerr.Error()}).Normalize()
-			} else {
-				ue = ue.Normalize()
-			}
-			lastErr = ue
-
-			// Once stream headers have already been flushed to the client, do not rotate.
-			if wasCommitted {
-				lease.Release()
-				recordResult(acct, ue.StatusCode, ue.Code, ue.Error(), nil)
-				return nil, ue
-			}
-
-			// Pre-output 401: try forcing a single token refresh on this account.
-			if ue.IsAuthError() && authTry == 0 && h.cfg.Scheduler != nil {
-				log.Printf("[server] 401 on acct=%s; attempting token refresh and single retry", acct.UID)
+			// Proactive refresh if access token is within 2 minutes of expiring.
+			if h.cfg.Scheduler != nil && acct.NeedsRefresh(time.Now(), 2*time.Minute) {
 				if rerr := h.cfg.Scheduler.RefreshOneTokenIfStale(ctx, acct.UID, acct.AccessToken); rerr == nil {
 					if fresh := h.cfg.Pool.AuthByUID(acct.UID); fresh != nil {
 						acct = fresh
-						continue
-					}
-				} else {
-					var se *auth.StepError
-					if errors.As(rerr, &se) && se.Expired {
-						log.Printf("WARN: [server] acct=%s refresh expired; rotating", acct.UID)
-					} else {
-						h.cfg.Pool.MarkSoftFailure(acct.UID, "401_refresh_failed")
 					}
 				}
 			}
 
-			// Apply appropriate pool cooldown / failure accounting before rotating.
-			if ue.IsRateLimit() {
-				h.cfg.Pool.MarkRateLimited(acct.UID, "quota_exhausted", ue.RetryAfter)
-			} else if ue.ShouldSwitchAccount() {
-				h.cfg.Pool.MarkSoftFailure(acct.UID, fmt.Sprintf("http_%d_%s", ue.StatusCode, ue.Kind))
-			}
+			authRefreshed := false
+			for {
+				var (
+					// streamMu serializes the header_wait timer callback, upstream
+					// events, and the post-Chat bookkeeping so that onStartStream /
+					// onEvent never run concurrently and never run after this attempt
+					// has handed the ResponseWriter back to the caller.
+					streamMu     sync.Mutex
+					committed    bool
+					turnDone     bool
+					timerStopped bool
+					firstEventAt time.Time
+					waitTimer    *time.Timer
+					timerExited  chan struct{}
+				)
+				commitStreamLocked := func() {
+					if committed {
+						return
+					}
+					committed = true
+					if waitTimer != nil && waitTimer.Stop() {
+						timerStopped = true
+					}
+					if onStartStream != nil {
+						onStartStream(acct, reqID)
+					}
+				}
 
-			if h.cfg.Session != nil && sessKey != "" && ue.ShouldSwitchAccount() {
-				h.cfg.Session.Unbind(sessKey)
-			}
-			excluded[acct.UID] = true
-			lease.Release()
+				if req.Stream && onStartStream != nil && snap.Upstream.HeaderWaitSeconds > 0 {
+					// Create the timer and publish waitTimer/timerExited while holding
+					// streamMu: the callback acquires streamMu before reading waitTimer
+					// (via commitStreamLocked), which gives a happens-before edge even
+					// when the timer fires before any upstream event.
+					exited := make(chan struct{})
+					streamMu.Lock()
+					timerExited = exited
+					waitTimer = time.AfterFunc(time.Duration(snap.Upstream.HeaderWaitSeconds)*time.Second, func() {
+						defer close(exited)
+						streamMu.Lock()
+						defer streamMu.Unlock()
+						if turnDone {
+							return
+						}
+						commitStreamLocked()
+					})
+					streamMu.Unlock()
+				}
 
-			if !ue.ShouldSwitchAccount() {
-				recordResult(acct, ue.StatusCode, ue.Code, ue.Error(), nil)
-				return nil, ue
+				res, cerr := h.cfg.Upstream.Chat(ctx, acct, req, func(ev upstream.ChatEvent) {
+					streamMu.Lock()
+					defer streamMu.Unlock()
+					if turnDone {
+						return
+					}
+					if firstEventAt.IsZero() {
+						firstEventAt = time.Now()
+					}
+					if req.Stream {
+						commitStreamLocked()
+						if onEvent != nil {
+							onEvent(ev)
+						}
+					}
+				})
+
+				streamMu.Lock()
+				turnDone = true
+				timerFired := false
+				if waitTimer != nil && !timerStopped && !waitTimer.Stop() {
+					// The AfterFunc callback has fired (or is about to run); wait for
+					// it to exit so no goroutine touches the ResponseWriter later.
+					timerFired = true
+				}
+				timerStopped = true
+				wasCommitted := committed
+				firstAt := firstEventAt
+				streamMu.Unlock()
+				if timerFired {
+					<-timerExited
+				}
+
+				// Check for empty output (no text and no tool calls) before committing.
+				if cerr == nil && strings.TrimSpace(res.Text) == "" && len(res.ToolCalls) == 0 {
+					if snap.EmptyRetryEnabled && !wasCommitted && !emptyRetried {
+						emptyRetried = true
+						log.Printf("[server] empty reply from acct=%s slot=%s; retrying once", acct.UID, slot)
+						continue
+					}
+					cerr = (&upstream.UpstreamError{
+						Kind:       upstream.ErrKindUpstream,
+						StatusCode: http.StatusBadGateway,
+						Code:       "upstream_empty_response",
+						Message:    "Amazon Quick returned an empty response with no text or tool calls",
+					}).Normalize()
+				}
+
+				if cerr == nil {
+					h.cfg.Pool.MarkSuccess(acct.UID, res.Usage.TotalTokens)
+					if h.cfg.Session != nil && sessKey != "" {
+						h.cfg.Session.Bind(sessKey, acct.UID, req.ConversationID)
+					}
+					if req.Stream && !wasCommitted && onStartStream != nil {
+						streamMu.Lock()
+						commitStreamLocked()
+						streamMu.Unlock()
+					}
+					resOut := &turnOutcome{
+						ReqID:        reqID,
+						Start:        start,
+						FirstEventAt: firstAt,
+						Account:      acct,
+						Slot:         slot,
+						Result:       res,
+						EmptyRetried: emptyRetried,
+					}
+					recordResult(acct, http.StatusOK, "", "", resOut)
+					return resOut, nil, false
+				}
+
+				// Client disconnect / cancel.
+				if ctx.Err() != nil {
+					recordResult(acct, 499, "client_canceled", "client canceled", nil)
+					return nil, &upstream.UpstreamError{StatusCode: 499, Code: "client_canceled", Message: "client canceled"}, false
+				}
+
+				var uerr *upstream.UpstreamError
+				if !errors.As(cerr, &uerr) {
+					uerr = (&upstream.UpstreamError{Kind: upstream.ErrKindUpstream, StatusCode: http.StatusBadGateway, Message: reqlog.ScrubCredentials(cerr.Error())}).Normalize()
+				} else {
+					cp := *uerr
+					cp.Message = reqlog.ScrubCredentials(cp.Message)
+					uerr = cp.Normalize()
+				}
+				lastErr = uerr
+
+				// Pre-output 401: try forcing a single token refresh on this account.
+				alreadyPenalized := false
+				if !wasCommitted && uerr.IsAuthError() && !authRefreshed && h.cfg.Scheduler != nil {
+					authRefreshed = true
+					log.Printf("[server] 401 on acct=%s; attempting token refresh and single retry", acct.UID)
+					if rerr := h.cfg.Scheduler.RefreshOneTokenIfStale(ctx, acct.UID, acct.AccessToken); rerr == nil {
+						if fresh := h.cfg.Pool.AuthByUID(acct.UID); fresh != nil {
+							acct = fresh
+							continue
+						}
+					} else {
+						var se *auth.StepError
+						if errors.As(rerr, &se) && se.Expired {
+							log.Printf("WARN: [server] acct=%s refresh expired; rotating", acct.UID)
+							alreadyPenalized = true
+						} else {
+							h.cfg.Pool.MarkSoftFailure(acct.UID, "401_refresh_failed")
+							alreadyPenalized = true
+						}
+					}
+				}
+
+				// Apply appropriate pool cooldown / failure accounting even when the stream has
+				// already been committed (only retrying/rotating is skipped post-commit).
+				if !alreadyPenalized {
+					if uerr.IsRateLimit() {
+						h.cfg.Pool.MarkRateLimited(acct.UID, "quota_exhausted", uerr.RetryAfter)
+					} else if uerr.ShouldSwitchAccount() {
+						h.cfg.Pool.MarkSoftFailure(acct.UID, fmt.Sprintf("http_%d_%s", uerr.StatusCode, uerr.Kind))
+					}
+				}
+
+				if h.cfg.Session != nil && sessKey != "" && uerr.ShouldSwitchAccount() {
+					h.cfg.Session.Unbind(sessKey)
+				}
+				excluded[acct.UID] = true
+
+				// Once stream headers have already been flushed to the client, do not rotate.
+				if wasCommitted || !uerr.ShouldSwitchAccount() {
+					recordResult(acct, uerr.StatusCode, uerr.Code, uerr.Error(), nil)
+					return nil, uerr, false
+				}
+				return nil, nil, true
 			}
-			break // break authTry loop -> rotate to next account
+		}()
+		if !rotate {
+			return out, ue
 		}
 	}
 
@@ -522,8 +592,10 @@ func setGatewayResponseHeaders(w http.ResponseWriter, reqID string, acct *auth.A
 	if reqID != "" {
 		w.Header().Set("X-Request-Id", reqID)
 	}
-	if acct != nil {
-		w.Header().Set("X-Quick-Account", acct.UID)
+	if acct != nil && acct.UID != "" {
+		// Never expose the raw UID on public /v1/* responses: it is derived from the
+		// account e-mail. An opaque digest still lets operators correlate requests.
+		w.Header().Set("X-Quick-Account", opaqueAccountID(acct.UID))
 	}
 	if actualModel != "" {
 		w.Header().Set("X-Quick-Actual-Model", actualModel)
@@ -531,6 +603,59 @@ func setGatewayResponseHeaders(w http.ResponseWriter, reqID string, acct *auth.A
 	if threadReused {
 		w.Header().Set("X-Quick-Thread-Reused", "true")
 	}
+}
+
+// opaqueAccountID returns a non-reversible short identifier for an account UID.
+func opaqueAccountID(uid string) string {
+	sum := sha256.Sum256([]byte(uid))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// modelPermitted enforces models.allowed / models.hidden at inference time so that
+// callers cannot bypass the GET /v1/models visibility rules by naming a model directly
+// or sending an unknown model name that falls back to the default slot.
+// An empty requested model always maps to the operator-configured default.
+func modelPermitted(snap config.LiveSnapshot, cat *upstream.ModelCatalog, reqModel, slot string, spec upstream.ModelSpec, suffixEffort string, known bool) bool {
+	key := strings.ToLower(strings.TrimSpace(reqModel))
+	if key == "" {
+		return true
+	}
+	if idx := strings.LastIndexByte(key, '/'); idx >= 0 {
+		key = key[idx+1:]
+	}
+	specID := strings.ToLower(spec.ID)
+	slotLow := strings.ToLower(strings.TrimSpace(slot))
+	cands := []string{key, specID, slotLow}
+	if suffixEffort != "" && specID != "" {
+		cands = append(cands, specID+"-"+suffixEffort)
+	}
+	if !known && cat != nil && slotLow != "" {
+		for _, s := range cat.Specs {
+			if strings.EqualFold(s.Slot, slotLow) {
+				if id := strings.ToLower(strings.TrimSpace(s.ID)); id != "" {
+					cands = append(cands, id)
+				}
+				break
+			}
+		}
+	}
+	for _, c := range cands {
+		if c != "" && snap.HiddenModels[c] {
+			return false
+		}
+	}
+	if !snap.AllowlistEnabled {
+		return true
+	}
+	if !known {
+		return false
+	}
+	for _, c := range cands {
+		if c != "" && snap.AllowedModels[c] {
+			return true
+		}
+	}
+	return false
 }
 
 func writeUpstreamErrorWithRetryAfter(w http.ResponseWriter, ue *upstream.UpstreamError, anthropic bool) {
@@ -556,6 +681,7 @@ func writeUpstreamErrorWithRetryAfter(w http.ResponseWriter, ue *upstream.Upstre
 	if status < 400 {
 		status = http.StatusBadGateway
 	}
+	msg := reqlog.ScrubCredentials(ue.Error())
 	if anthropic {
 		etype := "api_error"
 		switch status {
@@ -570,8 +696,8 @@ func writeUpstreamErrorWithRetryAfter(w http.ResponseWriter, ue *upstream.Upstre
 		case http.StatusGatewayTimeout:
 			etype = "overloaded_error"
 		}
-		writeAnthropicError(w, status, etype, ue.Error())
+		writeAnthropicError(w, status, etype, msg)
 		return
 	}
-	writeOpenAIError(w, status, ue.Code, ue.Error())
+	writeOpenAIError(w, status, ue.Code, msg)
 }

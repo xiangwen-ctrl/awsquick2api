@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"awsquick2api/internal/auth"
+	"awsquick2api/internal/reqlog"
 	"awsquick2api/internal/upstream"
 )
 
@@ -159,9 +160,12 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// Streaming SSE mode.
 	flusher, _ := w.(http.Flusher)
 	var (
-		writeMu sync.Mutex
-		started bool
+		writeMu   sync.Mutex
+		started   bool
+		keepalive *sseKeepalive
 	)
+	// Stop (and wait for) the heartbeat before any terminal write and on every return.
+	defer func() { keepalive.Stop() }()
 	writeSSEChunk := func(payload any) {
 		b, err := json.Marshal(payload)
 		if err != nil {
@@ -206,6 +210,14 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		writeMu.Unlock()
 
 		writeSSEChunk(baseChunk(map[string]any{"role": "assistant"}, nil))
+		keepalive = startSSEKeepalive(r.Context(), sseKeepaliveInterval, func() {
+			writeMu.Lock()
+			defer writeMu.Unlock()
+			_, _ = fmt.Fprint(w, ": keepalive\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+		})
 	}
 
 	onEvent := func(ev upstream.ChatEvent) {
@@ -218,6 +230,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out, ue := h.runChatTurn(r.Context(), r, "/v1/chat/completions", reqModel, upReq, onStart, onEvent)
+	keepalive.Stop()
 	if ue != nil {
 		if ue.StatusCode == 499 {
 			return
@@ -231,7 +244,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		}
 		writeSSEChunk(map[string]any{
 			"error": map[string]any{
-				"message": ue.Error(),
+				"message": reqlog.ScrubCredentials(ue.Error()),
 				"type":    ue.Code,
 				"code":    ue.Code,
 			},

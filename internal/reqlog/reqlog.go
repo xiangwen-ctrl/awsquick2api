@@ -30,10 +30,27 @@ const (
 )
 
 var (
-	credURLRe = regexp.MustCompile(`://[^/@\s]+@`)
-	bearerRe  = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}`)
-	apiKeyRe  = regexp.MustCompile(`\bqka?_[0-9a-fA-F]{12,}\b`)
-	jwtRe     = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
+	// scheme://user:pass@host (proxy URLs, *url.Error messages, DB URIs ...).
+	credURLRe = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/@\s"'<>]+@`)
+	// "Bearer <token>" anywhere (headers, error strings, URL-encoded %20).
+	bearerRe = regexp.MustCompile(`(?i)\b(Bearer)(?:\s+|%20)[A-Za-z0-9._~+/=-]{8,}`)
+	// Authorization header / field values of any scheme (Basic, Token, Digest ...).
+	authHeaderRe = regexp.MustCompile(`(?i)(\b(?:proxy-)?authorization["']?\s*[:=]\s*["']?)(?:(?:basic|bearer|token|digest|negotiate|aws4-hmac-sha256)\s+)?[^"'\s,;}]+`)
+	// Gateway keys: qk_ (inference api_key) and qka_ (panel admin_key), including custom hyphen/underscore keys.
+	apiKeyRe = regexp.MustCompile(`(?i)\bqka?_[A-Za-z0-9_-]{8,}`)
+	jwtRe    = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
+	// Query-string bearer/auth tokens (e.g. WebSocket ?token=... or &token=...).
+	queryTokenRe = regexp.MustCompile(`(?i)([?&]token=)([^"'\s&,;}\]]{4,})`)
+	// JSON / header / query / form style secrets: "refresh_token":"...", access_token=..., x-api-key: ...
+	secretFieldRe = regexp.MustCompile(`(?i)(["']?\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|client[_-]?secret|api[_-]?key|admin[_-]?key|x-api-key|password|passwd|secret|encryption[_-]?key|code[_-]?verifier)\b["']?\s*[:=]\s*["']?)([^"'\s&,;}\]]{4,})`)
+)
+
+const (
+	redactedURLCred = "***@"
+	redactedAuth    = "[REDACTED]"
+	redactedKey     = "[REDACTED_KEY]"
+	redactedJWT     = "[REDACTED_JWT]"
+	redactedField   = "[REDACTED]"
 )
 
 // Entry captures sanitized operational metadata only (never dialogue text or credentials).
@@ -88,6 +105,7 @@ type Recorder struct {
 	dir string
 
 	mu           sync.Mutex
+	sendMu       sync.RWMutex // guards blocking sends on archiveCh against close
 	archive      bool
 	closed       bool
 	archiveCh    chan archiveCmd
@@ -136,7 +154,7 @@ func (r *Recorder) ensureWriterLocked() {
 	if r.closed || r.dir == "" || r.archiveCh != nil {
 		return
 	}
-	_ = os.MkdirAll(r.dir, 0o755)
+	_ = os.MkdirAll(r.dir, 0o700)
 	r.archiveCh = make(chan archiveCmd, archiveQueueCap)
 	r.loopDone = make(chan struct{})
 	r.wg.Add(1)
@@ -165,7 +183,11 @@ func (r *Recorder) Close() {
 		ch := r.archiveCh
 		r.mu.Unlock()
 		if ch != nil {
+			// Wait for any Clear that observed closed == false to finish its send
+			// before closing, so nobody can send on a closed channel.
+			r.sendMu.Lock()
 			close(ch)
+			r.sendMu.Unlock()
 			r.wg.Wait()
 		}
 	})
@@ -222,6 +244,9 @@ func (r *Recorder) Clear(includeArchive bool) error {
 	if r == nil {
 		return nil
 	}
+	// sendMu (read side) is held from observing closed == false until the send
+	// completes; Close takes the write side before close(ch).
+	r.sendMu.RLock()
 	r.mu.Lock()
 	r.entries = make([]Entry, r.maxEntries)
 	r.entryHead = 0
@@ -233,13 +258,16 @@ func (r *Recorder) Clear(includeArchive bool) error {
 	r.mu.Unlock()
 
 	if !includeArchive || dir == "" {
+		r.sendMu.RUnlock()
 		return nil
 	}
 	if ch != nil && !closed {
 		done := make(chan error, 1)
 		select {
 		case ch <- archiveCmd{clearDone: done}:
+			r.sendMu.RUnlock()
 		case <-loopDone:
+			r.sendMu.RUnlock()
 			return removeArchiveFiles(dir)
 		}
 		select {
@@ -249,6 +277,7 @@ func (r *Recorder) Clear(includeArchive bool) error {
 			return removeArchiveFiles(dir)
 		}
 	}
+	r.sendMu.RUnlock()
 	return removeArchiveFiles(dir)
 }
 
@@ -286,7 +315,7 @@ func (r *Recorder) archiveLoop(ch <-chan archiveCmd, loopDone chan struct{}, dir
 		}
 		if day != openDay || f == nil {
 			closeFile()
-			_ = os.MkdirAll(dir, 0o755)
+			_ = os.MkdirAll(dir, 0o700)
 			path := filepath.Join(dir, "requests-"+day+".jsonl")
 			nf, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 			if err != nil {
@@ -361,8 +390,10 @@ func (r *Recorder) Recent(limit int) []Entry {
 	if r == nil {
 		return []Entry{}
 	}
-	if limit <= 0 || limit > r.maxEntries {
+	if limit <= 0 {
 		limit = 100
+	} else if limit > r.maxEntries {
+		limit = r.maxEntries
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -550,8 +581,10 @@ func (r *Recorder) RecentLogs(limit int) []LogLine {
 	if r == nil {
 		return []LogLine{}
 	}
-	if limit <= 0 || limit > r.maxLogs {
+	if limit <= 0 {
 		limit = 200
+	} else if limit > r.maxLogs {
+		limit = r.maxLogs
 	}
 	r.logMu.Lock()
 	defer r.logMu.Unlock()
@@ -569,7 +602,11 @@ func (r *Recorder) RecentLogs(limit int) []LogLine {
 	return out
 }
 
-// ScrubCredentials redacts embedded URL credentials, Bearer tokens, JWTs, and gateway keys.
+// ScrubCredentials redacts credentials from free-form text before it is logged or
+// persisted: URL userinfo (e.g. proxy user:pass@ inside *url.Error messages),
+// Authorization Bearer/Basic/Token values, qk_/qka_ gateway keys, JWTs, and
+// access/refresh/id tokens, client secrets, passwords and API keys written as
+// JSON fields, headers, query parameters or form values.
 func ScrubCredentials(s string) string {
 	return scrubCredentials(s)
 }
@@ -579,18 +616,44 @@ func scrubCredentials(s string) string {
 		return s
 	}
 	if strings.Contains(s, "://") && strings.Contains(s, "@") {
-		s = credURLRe.ReplaceAllString(s, "://***@")
+		s = credURLRe.ReplaceAllString(s, "${1}"+redactedURLCred)
 	}
-	if strings.Contains(strings.ToLower(s), "bearer ") {
-		s = bearerRe.ReplaceAllString(s, "Bearer [REDACTED]")
+	lower := strings.ToLower(s)
+	if strings.Contains(lower, "authorization") {
+		s = authHeaderRe.ReplaceAllString(s, "${1}"+redactedAuth)
 	}
-	if strings.Contains(s, "qk_") || strings.Contains(s, "qka_") {
-		s = apiKeyRe.ReplaceAllString(s, "[REDACTED_KEY]")
+	if strings.Contains(lower, "bearer") {
+		s = bearerRe.ReplaceAllString(s, "${1} "+redactedAuth)
+	}
+	if strings.Contains(lower, "qk_") || strings.Contains(lower, "qka_") {
+		s = apiKeyRe.ReplaceAllString(s, redactedKey)
 	}
 	if strings.Contains(s, "eyJ") {
-		s = jwtRe.ReplaceAllString(s, "[REDACTED_JWT]")
+		s = jwtRe.ReplaceAllString(s, redactedJWT)
+	}
+	if strings.Contains(lower, "token=") {
+		s = queryTokenRe.ReplaceAllStringFunc(s, func(m string) string {
+			sub := queryTokenRe.FindStringSubmatch(m)
+			if len(sub) < 3 || isRedactionMarker(sub[2]) {
+				return m
+			}
+			return sub[1] + redactedField
+		})
+	}
+	if strings.ContainsAny(s, ":=") {
+		s = secretFieldRe.ReplaceAllStringFunc(s, func(m string) string {
+			sub := secretFieldRe.FindStringSubmatch(m)
+			if len(sub) < 3 || isRedactionMarker(sub[2]) {
+				return m
+			}
+			return sub[1] + redactedField
+		})
 	}
 	return s
+}
+
+func isRedactionMarker(v string) bool {
+	return strings.HasPrefix(v, "[REDACTED") || strings.HasPrefix(v, "***")
 }
 
 func sanitizeText(s string, maxBytes int) string {

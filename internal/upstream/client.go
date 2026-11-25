@@ -122,12 +122,37 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 	}
 	piiPolicy := buildAccountPrivacyPolicy(acct, req.Messages, strictDLP)
 
+	// emittedAny records whether any event already reached the caller's stream.
+	// Once output has been forwarded, no retry (stale-thread fallback or 70%
+	// FrameTooLarge re-compose) may run, or two answers would be spliced into
+	// one SSE response.
+	emittedAny := false
+	if userOnEvent := onEvent; userOnEvent != nil {
+		onEvent = func(ev ChatEvent) {
+			emittedAny = true
+			userOnEvent(ev)
+		}
+	}
+
 	runAttempt := func(thread *ThreadEntry) (ChatResult, error) {
 		threadID := auth.NewUUID()
 		if thread != nil && thread.ID != "" {
 			threadID = thread.ID
 		}
+		retriedBudget := false
 		composed, cerr := c.composeTurn(ctx, acct, sess, cfg, pt, thread, threadID, cfg.MaxFrameBytes)
+		if cerr != nil {
+			var ue *UpstreamError
+			if errors.As(cerr, &ue) && ue.Kind == ErrKindTooLarge && cfg.MaxFrameBytes > 0 && !emittedAny {
+				smallerLimit := int(float64(cfg.MaxFrameBytes) * 0.7)
+				if smallerLimit >= 4096 {
+					retriedBudget = true
+					if comp2, c2err := c.composeTurn(ctx, acct, sess, cfg, pt, thread, threadID, smallerLimit); c2err == nil {
+						composed, cerr = comp2, nil
+					}
+				}
+			}
+		}
 		if cerr != nil {
 			if thread != nil {
 				c.Threads.Drop(thread.ID)
@@ -139,62 +164,67 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 		var (
 			bridge      *BridgeStream
 			streamedTxt strings.Builder
-			streamedRsn strings.Builder
 			textGuard   *privacyStreamRedactor
 			rsnGuard    *privacyStreamRedactor
 		)
+		// When response_format is json_object/json_schema, text must be cleaned and validated
+		// before emission, so even with tools enabled we buffer text instead of streaming raw deltas.
+		streamBridge := pt.bridge && req.Stream && onEvent != nil && pt.respFmt.Type == "text"
+		needRsnStream := onEvent != nil
+		needTextStream := streamBridge || (onEvent != nil && !pt.bridge && pt.respFmt.Type == "text")
 		initStreamGuards := func() {
 			streamedTxt.Reset()
-			streamedRsn.Reset()
-			if pt.bridge && req.Stream {
+			if streamBridge {
 				bridge = NewBridgeStream(pt.bridgeAllowed, func(t string) {
 					streamedTxt.WriteString(t)
-					if onEvent != nil {
-						onEvent(ChatEvent{Type: "text", Text: t})
-					}
+					onEvent(ChatEvent{Type: "text", Text: t})
 				})
 			} else {
 				bridge = nil
 			}
-			rsnGuard = newPrivacyPolicyStreamRedactor(piiPolicy, func(t string) {
-				streamedRsn.WriteString(t)
-				if onEvent != nil {
+			if needRsnStream {
+				rsnGuard = newPrivacyPolicyStreamRedactor(piiPolicy, func(t string) {
 					onEvent(ChatEvent{Type: "reasoning", Text: t})
-				}
-			})
-			textGuard = newPrivacyPolicyStreamRedactor(piiPolicy, func(t string) {
-				if pt.bridge && req.Stream {
-					bridge.Push(t)
-					return
-				}
-				if !pt.bridge && pt.respFmt.Type == "text" {
-					streamedTxt.WriteString(t)
-					if onEvent != nil {
-						onEvent(ChatEvent{Type: "text", Text: t})
+				})
+			} else {
+				rsnGuard = nil
+			}
+			if needTextStream {
+				textGuard = newPrivacyPolicyStreamRedactor(piiPolicy, func(t string) {
+					if streamBridge {
+						bridge.Push(t)
+						return
 					}
-				}
-			})
+					onEvent(ChatEvent{Type: "text", Text: t})
+				})
+			} else {
+				textGuard = nil
+			}
 		}
 		initStreamGuards()
 
-		emitWrapped := func(ev ChatEvent) {
-			if ev.Text == "" {
-				return
+		var emitWrapped func(ChatEvent)
+		if needRsnStream || needTextStream {
+			emitWrapped = func(ev ChatEvent) {
+				if ev.Text == "" {
+					return
+				}
+				if ev.Type == "reasoning" {
+					if rsnGuard != nil {
+						rsnGuard.Push(ev.Text)
+					}
+					return
+				}
+				if ev.Type == "text" && textGuard != nil {
+					textGuard.Push(ev.Text)
+				}
 			}
-			if ev.Type == "reasoning" {
-				rsnGuard.Push(ev.Text)
-				return
-			}
-			if ev.Type != "text" {
-				return
-			}
-			textGuard.Push(ev.Text)
 		}
 
 		res, werr := c.executeWSTurn(ctx, acct, sess, cfg, composed.Input, emitWrapped)
-		if werr != nil {
+		if werr != nil && !retriedBudget {
 			var ue *UpstreamError
-			if errors.As(werr, &ue) && ue.Kind == ErrKindTooLarge && cfg.MaxFrameBytes > 0 {
+			if errors.As(werr, &ue) && ue.Kind == ErrKindTooLarge && cfg.MaxFrameBytes > 0 && !emittedAny {
 				smallerLimit := int(float64(cfg.MaxFrameBytes) * 0.7)
 				if smallerLimit >= 4096 {
 					if comp2, c2err := c.composeTurn(ctx, acct, sess, cfg, pt, thread, threadID, smallerLimit); c2err == nil {
@@ -224,7 +254,7 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 		var calls []ToolCall
 		finalText := res.Text
 		if pt.bridge {
-			if req.Stream && bridge != nil {
+			if streamBridge && bridge != nil {
 				calls = bridge.Finish()
 				finalText = streamedTxt.String()
 			} else {
@@ -236,10 +266,33 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 			if !pt.parallel && len(calls) > 1 {
 				calls = calls[:1]
 			}
+			// tools + response_format: a plain (non tool-call) answer must still
+			// satisfy the requested JSON format (both buffered and streaming paths).
+			if pt.respFmt.Type != "" && pt.respFmt.Type != "text" {
+				if len(calls) == 0 {
+					cleaned := CleanJSONOutput(finalText)
+					var obj map[string]any
+					if jerr := json.Unmarshal([]byte(cleaned), &obj); jerr != nil || obj == nil {
+						if thread != nil {
+							c.Threads.Drop(thread.ID)
+						}
+						return ChatResult{}, (&UpstreamError{
+							Kind:       ErrKindUpstream,
+							StatusCode: 502,
+							Message:    "Amazon Quick 未返回符合 response_format 的有效 JSON 对象",
+						}).Normalize()
+					}
+					finalText = cleaned
+				}
+				if req.Stream && onEvent != nil && finalText != "" {
+					onEvent(ChatEvent{Type: "text", Text: finalText})
+				}
+			}
 		} else if pt.respFmt.Type != "text" {
 			cleaned := CleanJSONOutput(res.Text)
 			var obj map[string]any
-			if jerr := json.Unmarshal([]byte(cleaned), &obj); jerr != nil {
+			// "null" unmarshals into a nil map without error; json_object requires an object.
+			if jerr := json.Unmarshal([]byte(cleaned), &obj); jerr != nil || obj == nil {
 				if thread != nil {
 					c.Threads.Drop(thread.ID)
 				}
@@ -271,10 +324,12 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 		matched = c.Threads.Match(acctKey, req.ConversationID, pt.keys)
 	}
 	res, err := runAttempt(matched)
-	if err != nil && matched != nil && ctx.Err() == nil {
+	if err != nil && matched != nil && ctx.Err() == nil && !emittedAny {
 		var ue *UpstreamError
-		// If a resumed thread failed for non-handshake reasons, retry cleanly on a fresh full-history thread.
-		if !errors.As(err, &ue) || ue.Kind != ErrKindHandshake {
+		// If a resumed thread failed before any output reached the caller, retry cleanly on a
+		// fresh full-history thread. Handshake, guardrail and invalid-request failures are not
+		// caused by the stale thread, so retrying them only doubles cost.
+		if !errors.As(err, &ue) || (ue.Kind != ErrKindHandshake && ue.Kind != ErrKindBlocked && ue.Kind != ErrKindInvalid) {
 			res, err = runAttempt(nil)
 		}
 	}

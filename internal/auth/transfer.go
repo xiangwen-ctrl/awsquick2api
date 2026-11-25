@@ -13,12 +13,12 @@ import (
 )
 
 const (
-	encryptedBundleFormat  = "awsquick2api-encrypted-v1"
-	minPassphraseLen       = 12
-	scryptN                = 1 << 15 // 32768
-	scryptR                = 8
-	scryptP                = 1
-	aesKeyLen              = 32
+	encryptedBundleFormat = "awsquick2api-encrypted-v1"
+	minPassphraseLen      = 12
+	scryptN               = 1 << 15 // 32768
+	scryptR               = 8
+	scryptP               = 1
+	aesKeyLen             = 32
 )
 
 // EncryptedBundle is an AES-256-GCM + scrypt encrypted account migration file.
@@ -104,6 +104,23 @@ func IsEncryptedBundle(raw []byte) bool {
 	return probe.Format == encryptedBundleFormat
 }
 
+// maxScryptMemory caps the scrypt working set (128*N*r bytes) accepted from an import file,
+// so a crafted bundle cannot make the gateway allocate gigabytes and get OOM-killed.
+const (
+	maxScryptMemory = 64 << 20
+	maxScryptWork   = 1 << 20
+)
+
+// scryptParamsSafe validates untrusted scrypt parameters before any key derivation runs.
+func scryptParamsSafe(n, r, p int) bool {
+	if n < 16384 || n > 1<<20 || n&(n-1) != 0 || r < 1 || r > 32 || p < 1 || p > 16 {
+		return false
+	}
+	return int64(128)*int64(n)*int64(r) <= maxScryptMemory &&
+		int64(128)*int64(r)*int64(p) <= maxScryptMemory &&
+		int64(n)*int64(r)*int64(p) <= maxScryptWork
+}
+
 // DecryptAccounts decrypts an EncryptedBundle using passphrase and returns the accounts.
 func DecryptAccounts(raw []byte, passphrase string) ([]*Account, error) {
 	if passphrase == "" {
@@ -119,7 +136,7 @@ func DecryptAccounts(raw []byte, passphrase string) ([]*Account, error) {
 	if bundle.KDF.Name != "scrypt" || bundle.Cipher != "aes-256-gcm" {
 		return nil, fmt.Errorf("不支持的加密算法参数")
 	}
-	if bundle.KDF.N < 16384 || bundle.KDF.N > 1<<20 || bundle.KDF.R < 1 || bundle.KDF.R > 32 || bundle.KDF.P < 1 || bundle.KDF.P > 16 {
+	if !scryptParamsSafe(bundle.KDF.N, bundle.KDF.R, bundle.KDF.P) {
 		return nil, fmt.Errorf("KDF 参数超出安全范围")
 	}
 	salt, err := base64.StdEncoding.DecodeString(bundle.KDF.Salt)

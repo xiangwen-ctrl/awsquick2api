@@ -10,6 +10,7 @@ import (
 type LiveSnapshot struct {
 	APIKey               string
 	AdminKey             string
+	TrustedHosts         []string
 	Upstream             UpstreamConfig
 	Thinking             ThinkingConfig
 	SoftCooldown         time.Duration
@@ -77,9 +78,14 @@ func SnapshotFromConfig(cfg *Config) LiveSnapshot {
 		}
 		th.ModelOverrides = ov
 	}
+	var trustedHosts []string
+	if len(cfg.Server.TrustedHosts) > 0 {
+		trustedHosts = append([]string(nil), cfg.Server.TrustedHosts...)
+	}
 	return LiveSnapshot{
 		APIKey:               cfg.APIKey,
 		AdminKey:             cfg.AdminKey,
+		TrustedHosts:         trustedHosts,
 		Upstream:             cfg.Upstream,
 		Thinking:             th,
 		SoftCooldown:         time.Duration(cfg.Pool.SoftCooldownSec) * time.Second,

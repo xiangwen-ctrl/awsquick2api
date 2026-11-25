@@ -9,6 +9,10 @@ import (
 	"awsquick2api/internal/auth"
 )
 
+func validateImportedEndpoints(a *auth.Account) error {
+	return auth.ValidateImportedAccountEndpoints(a)
+}
+
 func (p *Panel) handleAccountsExportEncrypted(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Passphrase string `json:"passphrase"`
@@ -64,9 +68,18 @@ func (p *Panel) handleAccountsImport(w http.ResponseWriter, r *http.Request) {
 	imported := 0
 	skipped := 0
 	var errs []string
+	var importedUIDs []string
 	for _, a := range parsed {
 		if a == nil || (strings.TrimSpace(a.AccessToken) == "" && strings.TrimSpace(a.RefreshToken) == "") {
 			errs = append(errs, "跳过缺少 token 的记录")
+			continue
+		}
+		if verr := validateImportedEndpoints(a); verr != nil {
+			label := a.UID
+			if !auth.ValidUID(label) {
+				label = "(invalid uid)"
+			}
+			errs = append(errs, fmt.Sprintf("%s: 端点校验失败: %v", label, verr))
 			continue
 		}
 		a.Provider = auth.NormalizeProvider(a.Provider)
@@ -93,6 +106,11 @@ func (p *Panel) handleAccountsImport(w http.ResponseWriter, r *http.Request) {
 		}
 		p.cfg.Pool.AddOrUpdate(a)
 		imported++
+		importedUIDs = append(importedUIDs, a.UID)
+	}
+
+	if cb := p.cfg.OnAccountsImported; cb != nil && len(importedUIDs) > 0 {
+		go cb(importedUIDs)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{

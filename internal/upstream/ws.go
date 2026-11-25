@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -143,12 +144,19 @@ func (c *Client) sessionFromAccount(ctx context.Context, acct *auth.Account, cfg
 		return wsSession{}, &UpstreamError{Kind: ErrKindHandshake, StatusCode: 401, Message: "账号缺少有效访问令牌，请重新授权"}
 	}
 	gw := acct.IsGateway()
-	wsHost := strings.TrimSpace(acct.WSHost)
-	wsPath := strings.TrimSpace(acct.WSPath)
+	allowCustom := c.hasCustomEndpoints()
+	// Stored/imported endpoints are validated strictly: an untrusted ws_host is
+	// rejected and never downgraded to plaintext ws:// (loopback test servers are
+	// accepted only when explicit custom endpoint overrides are configured).
+	wsHost, wsPath, verr := accountWSEndpoint(acct, allowCustom)
+	if verr != nil {
+		return wsSession{}, verr
+	}
 
 	if gw {
+		// gatewayHost already validated the discovered host against the trusted allowlist.
 		if host, path, err := c.gatewayHost(ctx, acct); err == nil && host != "" {
-			if strings.HasPrefix(acct.TenantURL, "http://") {
+			if allowCustom && strings.HasPrefix(acct.TenantURL, "http://") && isLoopbackWSHost(hostOnly(host)) {
 				wsHost = "ws://" + host
 			} else {
 				wsHost = host
@@ -159,12 +167,28 @@ func (c *Client) sessionFromAccount(ctx context.Context, acct *auth.Account, cfg
 		}
 	}
 	if wsHost == "" && acct.TenantURL != "" {
-		if u, err := url.Parse(acct.TenantURL); err == nil && u.Host != "" {
-			if u.Scheme == "http" {
-				wsHost = "ws://" + u.Host
-			} else {
-				wsHost = u.Host
+		base := strings.TrimRight(strings.TrimSpace(acct.TenantURL), "/")
+		if _, terr := auth.ValidateTrustedURL(base, allowCustom); terr != nil {
+			return wsSession{}, (&UpstreamError{
+				Kind:       ErrKindHandshake,
+				StatusCode: http.StatusBadGateway,
+				Message:    "账号 tenant_url 未通过安全校验（" + terr.Error() + "），请重新授权",
+			}).Normalize()
+		}
+		if u, err := url.Parse(base); err == nil && u.Host != "" {
+			cand := "wss://" + u.Host
+			if strings.EqualFold(u.Scheme, "http") {
+				cand = "ws://" + u.Host
 			}
+			validated, terr := validateWSHost(cand, allowCustom)
+			if terr != nil {
+				return wsSession{}, (&UpstreamError{
+					Kind:       ErrKindHandshake,
+					StatusCode: http.StatusBadGateway,
+					Message:    "账号 tenant_url 未通过安全校验（" + terr.Error() + "），请重新授权",
+				}).Normalize()
+			}
+			wsHost = validated
 		}
 	}
 	if wsHost == "" {
@@ -195,6 +219,14 @@ func (c *Client) sessionFromAccount(ctx context.Context, acct *auth.Account, cfg
 	}, nil
 }
 
+// hostOnly strips an optional :port from host for loopback checks.
+func hostOnly(h string) string {
+	if hh, _, err := net.SplitHostPort(h); err == nil {
+		return hh
+	}
+	return h
+}
+
 func dialTarget(sess wsSession) (string, http.Header, error) {
 	host := strings.TrimRight(strings.TrimSpace(sess.WSHost), "/")
 	switch {
@@ -215,9 +247,8 @@ func dialTarget(sess wsSession) (string, http.Header, error) {
 		}
 	}
 	target := host
-	if strings.HasPrefix(path, "ws://") || strings.HasPrefix(path, "wss://") {
-		target = path
-	} else if strings.HasPrefix(path, "/") {
+	// ws_path is validated to be a plain absolute path; it can never replace the host.
+	if strings.HasPrefix(path, "/") {
 		target += path
 	} else {
 		target += "/" + path
@@ -260,7 +291,15 @@ type chunkAssembly struct {
 	parts []string
 	seen  []bool
 	have  int
+	size  int
 }
+
+const (
+	// maxChunkAssemblies caps how many distinct _chunked_frame ids may be
+	// in flight at once; maxChunkBytes caps their combined buffered payload.
+	maxChunkAssemblies = 64
+	maxChunkBytes      = maxEventStreamFrame
+)
 
 func (c *Client) executeWSTurn(
 	ctx context.Context,
@@ -327,9 +366,10 @@ func (c *Client) executeWSTurn(
 	conn.SetReadLimit(16 * 1024 * 1024)
 
 	var (
-		writeMu sync.Mutex
-		closed  bool
-		live    bool
+		writeMu  sync.Mutex
+		closed   bool
+		live     bool
+		readDead bool
 	)
 	encodeAndSend := func(val any) error {
 		rawJSON, jerr := json.Marshal(val)
@@ -355,16 +395,28 @@ func (c *Client) executeWSTurn(
 	}
 
 	sendStopAndClose := func() {
+		// Interrupt any in-flight write (e.g. a keepalive ping stuck on a black-holed
+		// TCP connection) so acquiring writeMu never waits out its 15s deadline.
+		if nc := conn.UnderlyingConn(); nc != nil {
+			_ = nc.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+		}
+		settle := stopSettleWait
+		if ctx.Err() != nil {
+			// The caller has gone away: just flush stop_generation, don't linger.
+			settle = 200 * time.Millisecond
+		}
+
 		writeMu.Lock()
 		wasLive := live
 		wasClosed := closed
+		wasReadDead := readDead
 		closed = true
-		writeMu.Unlock()
-
 		if wasClosed {
+			writeMu.Unlock()
 			return
 		}
-		if wasLive {
+		var stopWriteErr error
+		if wasLive && !wasReadDead {
 			stopJSON, _ := json.Marshal(map[string]any{
 				"type":    "stop_generation",
 				"payload": map[string]any{"thread_id": input.ThreadID},
@@ -375,17 +427,25 @@ func (c *Client) executeWSTurn(
 			} else {
 				wire, _ = EncodeAIDP(stopJSON)
 			}
-			_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-			_ = conn.WriteMessage(websocket.BinaryMessage, wire)
+			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+			stopWriteErr = conn.WriteMessage(websocket.BinaryMessage, wire)
+		}
+		writeMu.Unlock()
+
+		if wasLive && !wasReadDead && stopWriteErr == nil {
 			// Brief drain so stop_generation flushes before TCP FIN.
-			_ = conn.SetReadDeadline(time.Now().Add(stopSettleWait))
+			_ = conn.SetReadDeadline(time.Now().Add(settle))
 			for i := 0; i < 8; i++ {
 				if _, _, rerr := conn.ReadMessage(); rerr != nil {
 					break
 				}
 			}
 		}
-		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+		if !wasReadDead && stopWriteErr == nil {
+			writeMu.Lock()
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(500*time.Millisecond))
+			writeMu.Unlock()
+		}
 		_ = conn.Close()
 	}
 
@@ -443,7 +503,10 @@ func (c *Client) executeWSTurn(
 	if keepaliveDur <= 0 {
 		keepaliveDur = 25 * time.Second
 	}
+	var pingWG sync.WaitGroup
+	pingWG.Add(1)
 	go func() {
+		defer pingWG.Done()
 		tk := time.NewTicker(keepaliveDur)
 		defer tk.Stop()
 		for {
@@ -453,10 +516,19 @@ func (c *Client) executeWSTurn(
 			case <-turnCtx.Done():
 				return
 			case <-tk.C:
-				_ = encodeAndSend(map[string]any{
+				if err := encodeAndSend(map[string]any{
 					"type":    "ping",
 					"payload": map[string]any{"timestamp": time.Now().UnixMilli()},
-				})
+				}); err != nil {
+					return
+				}
+				select {
+				case <-pingDone:
+					return
+				case <-turnCtx.Done():
+					return
+				default:
+				}
 				writeMu.Lock()
 				if !closed {
 					_ = conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second))
@@ -473,7 +545,17 @@ func (c *Client) executeWSTurn(
 	defer func() {
 		cancelStop()
 		close(pingDone)
+		if ctx.Err() != nil {
+			// User cancelled: return immediately; the bounded stop/close
+			// handshake finishes in the background.
+			go func() {
+				sendStopAndClose()
+				pingWG.Wait()
+			}()
+			return
+		}
 		sendStopAndClose()
+		pingWG.Wait()
 	}()
 
 	var (
@@ -481,6 +563,7 @@ func (c *Client) executeWSTurn(
 		thoughtBuf  strings.Builder
 		usage       Usage
 		chunks      = map[string]*chunkAssembly{}
+		chunkBytes  int
 		seenTools   = map[string]bool{}
 		decoder     = NewWireDecoder(sess.Gateway)
 		idleDur     = time.Duration(cfg.IdleTimeoutSeconds) * time.Second
@@ -511,8 +594,11 @@ func (c *Client) executeWSTurn(
 		emit(ChatEvent{Type: "text", Text: delta})
 	}
 
-	var handleEnv func(env map[string]any) (done bool, failErr error)
-	handleEnv = func(env map[string]any) (bool, error) {
+	var handleEnv func(env map[string]any, depth int) (done bool, failErr error)
+	handleEnv = func(env map[string]any, depth int) (bool, error) {
+		if depth > 4 {
+			return false, (&UpstreamError{Kind: ErrKindUpstream, StatusCode: 502, Message: "upstream chunked frame nesting too deep"}).Normalize()
+		}
 		evType, _ := env["type"].(string)
 		p, _ := env["payload"].(map[string]any)
 		if p == nil {
@@ -533,6 +619,11 @@ func (c *Client) executeWSTurn(
 			}
 			entry := chunks[cid]
 			if entry == nil || len(entry.parts) != total {
+				if entry != nil {
+					chunkBytes -= entry.size
+				} else if len(chunks) >= maxChunkAssemblies {
+					return false, (&UpstreamError{Kind: ErrKindUpstream, StatusCode: 502, Message: "too many concurrent upstream chunked frames"}).Normalize()
+				}
 				entry = &chunkAssembly{parts: make([]string, total), seen: make([]bool, total)}
 				chunks[cid] = entry
 			}
@@ -540,14 +631,21 @@ func (c *Client) executeWSTurn(
 				entry.seen[idx] = true
 				entry.have++
 			}
+			delta := len(data) - len(entry.parts[idx])
 			entry.parts[idx] = data
+			entry.size += delta
+			chunkBytes += delta
+			if chunkBytes > maxChunkBytes {
+				return false, (&UpstreamError{Kind: ErrKindUpstream, StatusCode: 502, Message: "upstream chunked frame exceeds size limit"}).Normalize()
+			}
 			if entry.have < total {
 				return false, nil
 			}
 			delete(chunks, cid)
+			chunkBytes -= entry.size
 			var inner map[string]any
 			if json.Unmarshal([]byte(strings.Join(entry.parts, "")), &inner) == nil && inner != nil {
-				return handleEnv(inner)
+				return handleEnv(inner, depth+1)
 			}
 			return false, nil
 
@@ -659,7 +757,25 @@ func (c *Client) executeWSTurn(
 		return false, nil
 	}
 
+	checkTurnCtx := func() (bool, error) {
+		if turnCtx.Err() == nil {
+			return false, nil
+		}
+		if hasComplete {
+			return true, nil
+		}
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, (&UpstreamError{Kind: ErrKindTimeout, StatusCode: 504, Message: "upstream request timed out"}).Normalize()
+	}
+
 	for {
+		if done, cerr := checkTurnCtx(); cerr != nil {
+			return ChatResult{}, cerr
+		} else if done {
+			break
+		}
 		dl := time.Now().Add(idleDur)
 		if hasComplete && completeAt.Before(dl) {
 			dl = completeAt
@@ -668,24 +784,30 @@ func (c *Client) executeWSTurn(
 			dl = ctxDL
 		}
 		_ = conn.SetReadDeadline(dl)
+		if done, cerr := checkTurnCtx(); cerr != nil {
+			return ChatResult{}, cerr
+		} else if done {
+			break
+		}
 
 		msgType, rawMsg, rerr := conn.ReadMessage()
 		if rerr != nil {
-			if hasComplete && time.Now().After(completeAt.Add(-50*time.Millisecond)) {
+			// Success is decided strictly by a final message_complete: a reply that
+			// was cut off mid-stream must not be treated as a complete answer
+			// (it would poison the ThreadStore and leak half-open tool XML), while
+			// an empty-text complete followed by an immediate close is still valid.
+			if hasComplete {
 				break
 			}
 			if ctx.Err() != nil {
 				return ChatResult{}, ctx.Err()
 			}
+			// Connection already failed or timed out on read: don't linger draining on close.
+			writeMu.Lock()
+			readDead = true
+			writeMu.Unlock()
 			if errors.Is(turnCtx.Err(), context.DeadlineExceeded) {
-				if textBuf.Len() > 0 {
-					break
-				}
 				return ChatResult{}, (&UpstreamError{Kind: ErrKindTimeout, StatusCode: 504, Message: "upstream request timed out"}).Normalize()
-			}
-			if textBuf.Len() > 0 {
-				// Partial reply after message started still succeeds cleanly.
-				break
 			}
 			if ne, ok := rerr.(interface{ Timeout() bool }); ok && ne.Timeout() {
 				return ChatResult{}, (&UpstreamError{Kind: ErrKindTimeout, StatusCode: 504, Message: "upstream WebSocket read timed out"}).Normalize()
@@ -704,6 +826,14 @@ func (c *Client) executeWSTurn(
 					writeMu.Lock()
 					live = false
 					writeMu.Unlock()
+					// EventStream exception frames carry the same codes as JSON
+					// failure events; FrameTooLarge must stay retryable at 70%.
+					if strings.Contains(derr.Error(), "[FrameTooLarge]") {
+						return ChatResult{}, (&UpstreamError{Kind: ErrKindTooLarge, StatusCode: 400, Code: "context_length_exceeded", Message: derr.Error()}).Normalize()
+					}
+					if strings.Contains(derr.Error(), "[ThrottlingException]") {
+						return ChatResult{}, (&UpstreamError{Kind: ErrKindUpstream, StatusCode: 429, Code: "rate_limit_exceeded", Message: derr.Error()}).Normalize()
+					}
 					return ChatResult{}, (&UpstreamError{Kind: ErrKindUpstream, StatusCode: 502, Message: derr.Error()}).Normalize()
 				}
 				continue
@@ -715,7 +845,7 @@ func (c *Client) executeWSTurn(
 			if err := json.Unmarshal([]byte(frame), &env); err != nil || env == nil {
 				continue
 			}
-			done, ferr := handleEnv(env)
+			done, ferr := handleEnv(env, 0)
 			if ferr != nil {
 				return ChatResult{}, ferr
 			}

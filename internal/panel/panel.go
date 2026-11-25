@@ -11,8 +11,11 @@ import (
 	"io/fs"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,6 +60,19 @@ type Config struct {
 	EnvOverrides func() []string
 	LoadConfig   func() (*config.Config, error)
 	SaveConfig   func(raw []byte) (SaveConfigResult, error)
+
+	// ListenAddr is the effective listen address (after env overrides). When empty the
+	// panel falls back to config.json "listen" via LoadConfig. When it binds a loopback
+	// host the panel only accepts Host headers naming 127.0.0.1/localhost/[::1], the
+	// listen host or TrustedHosts (anti DNS rebinding); non-loopback binds are unaffected.
+	ListenAddr string
+	// TrustedHosts lists extra Host header hostnames accepted on loopback binds, e.g. the
+	// public hostname of a reverse proxy that preserves the Host header.
+	TrustedHosts []string
+	// OnAccountsImported, when non-nil, is invoked asynchronously (in its own goroutine)
+	// with the UIDs persisted by a successful encrypted import, e.g. to sync quota and
+	// AdvancedEnabled for the new accounts.
+	OnAccountsImported func(uids []string)
 }
 
 type Panel struct {
@@ -64,14 +80,44 @@ type Panel struct {
 	mux     *http.ServeMux
 	started time.Time
 	saveMu  sync.Mutex
+	authLim *authLimiter
+
+	// hostGuard is true when the effective listen address binds a loopback host;
+	// listenHost is that host (lower-cased, without port/brackets).
+	hostGuard  bool
+	listenHost string
+
+	trustedMu    sync.RWMutex
+	trustedHosts []string
+	trustedSet   bool
+}
+
+// resolveListenHost determines the listen host used for the Host header guard:
+// Config.ListenAddr first, else config.json "listen" via LoadConfig (listen changes
+// require a restart, so reading it once is sufficient).
+func resolveListenHost(cfg Config) (string, bool) {
+	listen := strings.TrimSpace(cfg.ListenAddr)
+	if listen == "" && cfg.LoadConfig != nil {
+		if c, err := cfg.LoadConfig(); err == nil && c != nil {
+			listen = strings.TrimSpace(c.Listen)
+		}
+	}
+	if listen == "" {
+		return "", false
+	}
+	h := hostOnly(listen)
+	return h, isLoopbackHost(h)
 }
 
 func New(cfg Config) *Panel {
 	p := &Panel{
-		cfg:     cfg,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
+		cfg:          cfg,
+		mux:          http.NewServeMux(),
+		started:      time.Now(),
+		authLim:      newAuthLimiter(),
+		trustedHosts: append([]string(nil), cfg.TrustedHosts...),
 	}
+	p.listenHost, p.hostGuard = resolveListenHost(cfg)
 
 	sub, err := fs.Sub(webFS, "web")
 	if err != nil {
@@ -106,6 +152,7 @@ func New(cfg Config) *Panel {
 	p.mux.HandleFunc("PATCH /panel/api/models/claude-aliases", p.withAuth(p.handleClaudeAliasesToggle))
 	p.mux.HandleFunc("PUT /panel/api/models/{slot}/rename", p.withAuth(p.handleModelRename))
 	p.mux.HandleFunc("PATCH /panel/api/models/{id}", p.withAuth(p.handleModelVisibilityToggle))
+	p.mux.HandleFunc("PATCH /panel/api/features/strict-privacy-dlp", p.withAuth(p.handleStrictPrivacyToggle))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.handleConfigGet))
 	p.mux.HandleFunc("PUT /panel/api/config", p.withAuth(p.handleConfigSave))
 	p.mux.HandleFunc("GET /panel/api/requests", p.withAuth(p.handleRequests))
@@ -121,6 +168,10 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	if strings.HasPrefix(r.URL.Path, "/panel/api/") {
 		w.Header().Set("Cache-Control", "no-store")
+	}
+	if !p.hostAllowed(r.Host) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "host not allowed"})
+		return
 	}
 	p.mux.ServeHTTP(w, r)
 }
@@ -139,10 +190,19 @@ func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "cross-origin request rejected"})
 			return
 		}
+		ip := clientIP(r)
+		if blocked, wait := p.authLim.blocked(ip); blocked {
+			secs := int(wait/time.Second) + 1
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+			writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": fmt.Sprintf("too many failed admin_key attempts, retry in %ds", secs)})
+			return
+		}
 		if !httpauth.VerifyBearer(r, key) {
+			p.authLim.fail(ip)
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized: valid admin_key required"})
 			return
 		}
+		p.authLim.reset(ip)
 		if isWriteMethod(r.Method) {
 			isImport := r.URL.Path == "/panel/api/accounts/import"
 			if hasRequestBody(r) {
@@ -200,6 +260,174 @@ func isSameOriginRequest(r *http.Request) bool {
 	return true
 }
 
+// --- Host allowlist (anti DNS rebinding) ---
+
+// UpdateTrustedHosts replaces the active Host-header allowlist used on loopback binds.
+func (p *Panel) UpdateTrustedHosts(hosts []string) {
+	if p == nil {
+		return
+	}
+	cp := append([]string(nil), hosts...)
+	p.trustedMu.Lock()
+	p.trustedHosts = cp
+	p.trustedSet = true
+	p.trustedMu.Unlock()
+}
+
+// hostAllowed reports whether the request Host header is acceptable. Only loopback
+// binds are restricted; wildcard / LAN binds are left to network-level controls.
+func (p *Panel) hostAllowed(reqHost string) bool {
+	if !p.hostGuard {
+		return true
+	}
+	lh := p.listenHost
+	h := hostOnly(reqHost)
+	if h == "" {
+		return false
+	}
+	if isLoopbackHost(h) || h == lh {
+		return true
+	}
+	p.trustedMu.RLock()
+	hosts := p.trustedHosts
+	explicit := p.trustedSet
+	p.trustedMu.RUnlock()
+	for _, t := range hosts {
+		if th := hostOnly(t); th != "" && th == h {
+			return true
+		}
+	}
+	if !explicit && p.cfg.Live != nil {
+		for _, t := range p.cfg.Live.Load().TrustedHosts {
+			if th := hostOnly(t); th != "" && th == h {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hostOnly strips the port and IPv6 brackets and lower-cases a host[:port] value.
+func hostOnly(s string) string {
+	s = strings.TrimSpace(s)
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		s = h
+	}
+	s = strings.TrimSuffix(strings.TrimPrefix(s, "["), "]")
+	s = strings.TrimSuffix(s, ".")
+	return strings.ToLower(s)
+}
+
+func isLoopbackHost(h string) bool {
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
+}
+
+// --- admin_key failure rate limiting (per source IP, fixed window, bounded memory) ---
+
+var (
+	authFailLimit      = 10
+	authFailWindow     = 5 * time.Minute
+	authLimiterMaxKeys = 4096
+)
+
+type authFailEntry struct {
+	count int
+	start time.Time
+}
+
+type authLimiter struct {
+	mu  sync.Mutex
+	m   map[string]*authFailEntry
+	now func() time.Time
+}
+
+func newAuthLimiter() *authLimiter {
+	return &authLimiter{m: make(map[string]*authFailEntry), now: time.Now}
+}
+
+// blocked reports whether ip exhausted its failure budget and how long until the window resets.
+func (l *authLimiter) blocked(ip string) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e := l.m[ip]
+	if e == nil {
+		return false, 0
+	}
+	elapsed := l.now().Sub(e.start)
+	if elapsed >= authFailWindow {
+		delete(l.m, ip)
+		return false, 0
+	}
+	if e.count >= authFailLimit {
+		return true, authFailWindow - elapsed
+	}
+	return false, 0
+}
+
+func (l *authLimiter) fail(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	e := l.m[ip]
+	if e != nil && now.Sub(e.start) >= authFailWindow {
+		e = nil
+	}
+	if e == nil {
+		if _, exists := l.m[ip]; !exists && len(l.m) >= authLimiterMaxKeys {
+			for k, v := range l.m {
+				if now.Sub(v.start) >= authFailWindow {
+					delete(l.m, k)
+				}
+			}
+			for len(l.m) >= authLimiterMaxKeys {
+				var (
+					oldestKey  string
+					oldestTime time.Time
+					first      = true
+				)
+				for k, v := range l.m {
+					if first || v.start.Before(oldestTime) || (v.start.Equal(oldestTime) && k < oldestKey) {
+						oldestKey = k
+						oldestTime = v.start
+						first = false
+					}
+				}
+				if first {
+					break
+				}
+				delete(l.m, oldestKey)
+			}
+		}
+		e = &authFailEntry{start: now}
+		l.m[ip] = e
+	}
+	e.count++
+}
+
+func (l *authLimiter) reset(ip string) {
+	l.mu.Lock()
+	delete(l.m, ip)
+	l.mu.Unlock()
+}
+
+func (l *authLimiter) size() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.m)
+}
+
+// clientIP uses the TCP peer address only; forwarding headers are spoofable.
+func clientIP(r *http.Request) string {
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return h
+	}
+	return r.RemoteAddr
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -249,11 +477,13 @@ func (p *Panel) handleOverview(w http.ResponseWriter, _ *http.Request) {
 	callbackPort := 18080
 	appVer := "1.2.4660"
 	proxyConfigured := false
+	privacyDLP := false
 	if p.cfg.Live != nil {
 		snap := p.cfg.Live.Load()
 		callbackPort = snap.Upstream.CallbackPort
 		appVer = snap.Upstream.AppVersion
 		proxyConfigured = strings.TrimSpace(snap.Upstream.ProxyURL) != ""
+		privacyDLP = snap.StrictPrivacyDLP
 	}
 	if p.cfg.Session != nil {
 		sticky = p.cfg.Session.Count()
@@ -267,15 +497,16 @@ func (p *Panel) handleOverview(w http.ResponseWriter, _ *http.Request) {
 		activePorts = p.cfg.CallbackMgr.ActivePorts()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":          p.cfg.Version,
-		"app_version":      appVer,
-		"uptime_sec":       int64(time.Since(p.started).Seconds()),
-		"callback_port":    callbackPort,
-		"active_cb_ports":  activePorts,
-		"proxy_configured": proxyConfigured,
-		"pool":             p.cfg.Pool.Summary(),
-		"sticky_count":     sticky,
-		"metrics":          metrics,
+		"version":            p.cfg.Version,
+		"app_version":        appVer,
+		"uptime_sec":         int64(time.Since(p.started).Seconds()),
+		"callback_port":      callbackPort,
+		"active_cb_ports":    activePorts,
+		"proxy_configured":   proxyConfigured,
+		"strict_privacy_dlp": privacyDLP,
+		"pool":               p.cfg.Pool.Summary(),
+		"sticky_count":       sticky,
+		"metrics":            metrics,
 	})
 }
 
@@ -609,6 +840,32 @@ func (p *Panel) handleModelVisibilityToggle(w http.ResponseWriter, r *http.Reque
 		nextHidden = append(nextHidden, id)
 	}
 	cfg.Models.Hidden = nextHidden
+	if len(cfg.Models.Allowed) > 0 {
+		if req.Visible {
+			found := false
+			for _, a := range cfg.Models.Allowed {
+				if strings.ToLower(strings.TrimSpace(a)) == low {
+					found = true
+					break
+				}
+			}
+			if !found {
+				cfg.Models.Allowed = append(cfg.Models.Allowed, id)
+			}
+		} else {
+			var nextAllowed []string
+			for _, a := range cfg.Models.Allowed {
+				if strings.ToLower(strings.TrimSpace(a)) != low {
+					nextAllowed = append(nextAllowed, a)
+				}
+			}
+			// Only drop from models.allowed when other allowed entries remain; emptying
+			// models.allowed would disable the allowlist and expose every other model.
+			if len(nextAllowed) > 0 {
+				cfg.Models.Allowed = nextAllowed
+			}
+		}
+	}
 	raw, _ := json.Marshal(cfg)
 	if _, err := p.cfg.SaveConfig(raw); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -630,6 +887,8 @@ func (p *Panel) handleModelRename(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "upstream unavailable"})
 		return
 	}
+	p.saveMu.Lock()
+	defer p.saveMu.Unlock()
 	next, spec, oldID, err := p.cfg.Upstream.GetCatalog().RenameSlot(slot, req.ID, req.Display)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -642,7 +901,138 @@ func (p *Panel) handleModelRename(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	p.cfg.Upstream.SetCatalog(next)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "old_id": oldID, "model": spec})
+	resp := map[string]any{"ok": true, "old_id": oldID, "model": spec, "config_migrated": 0}
+	if newID := strings.TrimSpace(spec.ID); strings.TrimSpace(oldID) != "" && newID != "" && !strings.EqualFold(strings.TrimSpace(oldID), newID) {
+		n, merr := p.migrateModelRefsLocked(strings.TrimSpace(oldID), newID)
+		resp["config_migrated"] = n
+		if merr != nil {
+			log.Printf("WARN: [panel] model rename %s -> %s: config.json sync failed: %v", oldID, newID, merr)
+			resp["config_sync_error"] = merr.Error()
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// modelVariantSuffixRE matches the effort / context suffixes a model reference may carry.
+var modelVariantSuffixRE = regexp.MustCompile(`^(?:-(?:off|minimal|low|medium|high|xhigh|max))?(?:\[1m\])?$`)
+
+// renameModelRef rewrites entry when it names oldID (case-insensitive), optionally with
+// an effort/[1m] variant suffix, preserving that suffix.
+func renameModelRef(entry, oldID, newID string) (string, bool) {
+	t := strings.TrimSpace(entry)
+	if oldID == "" || len(t) < len(oldID) || !strings.EqualFold(t[:len(oldID)], oldID) {
+		return entry, false
+	}
+	suffix := t[len(oldID):]
+	if !modelVariantSuffixRE.MatchString(strings.ToLower(suffix)) {
+		return entry, false
+	}
+	return newID + suffix, true
+}
+
+func renameModelList(list []string, oldID, newID string) ([]string, int) {
+	if len(list) == 0 {
+		return list, 0
+	}
+	changed := 0
+	seen := make(map[string]bool, len(list))
+	out := make([]string, 0, len(list))
+	for _, e := range list {
+		v, ok := renameModelRef(e, oldID, newID)
+		if ok {
+			changed++
+		}
+		k := strings.ToLower(strings.TrimSpace(v))
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, v)
+	}
+	return out, changed
+}
+
+func renameModelKeys(m map[string]string, oldID, newID string) (map[string]string, int) {
+	if len(m) == 0 {
+		return m, 0
+	}
+	out := make(map[string]string, len(m))
+	seenLower := make(map[string]bool, len(m))
+	renamed := map[string]string{}
+	for k, v := range m {
+		if nk, ok := renameModelRef(k, oldID, newID); ok {
+			renamed[nk] = v
+			continue
+		}
+		out[k] = v
+		seenLower[strings.ToLower(strings.TrimSpace(k))] = true
+	}
+	rkeys := make([]string, 0, len(renamed))
+	for nk := range renamed {
+		rkeys = append(rkeys, nk)
+	}
+	sort.Strings(rkeys)
+	for _, nk := range rkeys {
+		low := strings.ToLower(strings.TrimSpace(nk))
+		if seenLower[low] {
+			continue
+		}
+		seenLower[low] = true
+		out[nk] = renamed[nk]
+	}
+	return out, len(renamed)
+}
+
+// migrateModelRefs rewrites references to a renamed model ID in config.json:
+// models.hidden, models.allowed and thinking.model_overrides keys.
+func (p *Panel) migrateModelRefs(oldID, newID string) (int, error) {
+	p.saveMu.Lock()
+	defer p.saveMu.Unlock()
+	return p.migrateModelRefsLocked(oldID, newID)
+}
+
+func (p *Panel) migrateModelRefsLocked(oldID, newID string) (int, error) {
+	if p.cfg.LoadConfig == nil || p.cfg.SaveConfig == nil {
+		return 0, nil
+	}
+	cfg, err := p.cfg.LoadConfig()
+	if err != nil {
+		return 0, err
+	}
+	var c1, c2, c3 int
+	cfg.Models.Hidden, c1 = renameModelList(cfg.Models.Hidden, oldID, newID)
+	cfg.Models.Allowed, c2 = renameModelList(cfg.Models.Allowed, oldID, newID)
+	cfg.Thinking.ModelOverrides, c3 = renameModelKeys(cfg.Thinking.ModelOverrides, oldID, newID)
+	n := c1 + c2 + c3
+	if n == 0 {
+		return 0, nil
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := p.cfg.SaveConfig(raw); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func (p *Panel) handleStrictPrivacyToggle(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Enabled == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing enabled"})
+		return
+	}
+	if err := p.patchConfig(map[string]any{"features": map[string]any{"strict_privacy_dlp": *req.Enabled}}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": *req.Enabled})
 }
 
 // --- Config, Requests (metadata-only), Logs ---

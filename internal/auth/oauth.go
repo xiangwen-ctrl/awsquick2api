@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -104,7 +105,7 @@ func ValidateTrustedURL(raw string, allowCustom bool) (string, error) {
 	if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" {
 		return "", &StepError{Status: 400, Message: "授权发现端点格式无效"}
 	}
-	host := strings.ToLower(u.Hostname())
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
 	if allowCustom && (host == "127.0.0.1" || host == "localhost" || host == "::1") && (u.Scheme == "http" || u.Scheme == "https") {
 		return v, nil
 	}
@@ -116,6 +117,9 @@ func ValidateTrustedURL(raw string, allowCustom bool) (string, error) {
 	}
 	if host == "quick.aws.com" || host == "accounts.google.com" || host == "oauth2.googleapis.com" || platoCellHostRE.MatchString(host) {
 		return v, nil
+	}
+	if isCustomerHostedAWSHost(host) {
+		return "", &StepError{Status: 400, Message: fmt.Sprintf("授权发现端点属于可托管任意用户内容的 AWS 域名，已拒绝 (%s)", host)}
 	}
 	for _, suf := range trustedHostSuffixes {
 		if strings.HasSuffix(host, suf) {
@@ -362,7 +366,7 @@ func executeJSON(client *http.Client, req *http.Request) (map[string]any, error)
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
-	resp, err := client.Do(req)
+	resp, err := guardRedirects(client).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -595,6 +599,20 @@ func buildAccountFromTokens(base *Account, tokens tokenBundle, info UserInfo, ov
 	}, nil
 }
 
+// useOIDCJSONTokenEndpoint reports whether the token endpoint expects AWS SSO OIDC JSON
+// payloads (personal Social IdC) rather than standard OAuth2 form-encoded payloads
+// (Enterprise, Gateway, and SocialGateway).
+func useOIDCJSONTokenEndpoint(provider, idcRegion, tokenEndpoint string) bool {
+	if NormalizeProvider(provider) != ProviderSocial {
+		return false
+	}
+	if strings.TrimSpace(idcRegion) != "" {
+		return true
+	}
+	ep := strings.TrimSpace(tokenEndpoint)
+	return ep == "" || strings.Contains(strings.ToLower(ep), "oidc.")
+}
+
 // RefreshTokens exchanges an account's refresh_token for fresh tokens and merges metadata.
 // Uses context.WithoutCancel on the upstream token exchange so a caller abort never discards
 // a server-rotated refresh_token.
@@ -616,7 +634,7 @@ func RefreshTokens(ctx context.Context, client *http.Client, acct *Account, ov E
 		raw map[string]any
 		err error
 	)
-	if IsEnterpriseDiscovery(provider) || (acct.TokenEndpoint != "" && !strings.Contains(acct.TokenEndpoint, "oidc.") && acct.IDCRegion == "") {
+	if !useOIDCJSONTokenEndpoint(provider, acct.IDCRegion, acct.TokenEndpoint) {
 		ep := strings.TrimSpace(acct.TokenEndpoint)
 		if ep == "" {
 			return nil, &StepError{Status: 401, Message: "账号缺少 token_endpoint，请重新授权", Expired: true}
@@ -711,8 +729,26 @@ type DiscoveryData struct {
 	ClientSecretExpiresAt int64
 }
 
+// LoginFlow statuses. Every transition happens under LoginFlow.mu as a compare-and-swap on
+// Status, so concurrent callbacks (browser tab + pasted URL, double clicks, replays) cannot
+// run discovery twice or redeem the one-time authorization code twice.
+const (
+	flowAwaitingDiscovery     = "awaiting_discovery"
+	flowDiscovering           = "discovering"
+	flowAwaitingAuthorization = "awaiting_authorization"
+	flowExchanging            = "exchanging"
+	flowAuthorized            = "authorized"
+	flowFailed                = "failed"
+	flowExpired               = "expired"
+	flowCancelled             = "cancelled"
+)
+
 // LoginFlow represents one user-initiated PKCE desktop sign-in session.
+//
+// All mutable fields are guarded by mu; network round-trips run without holding it.
 type LoginFlow struct {
+	mu sync.Mutex
+
 	ID            string
 	Provider      string
 	Stage         string
@@ -725,7 +761,7 @@ type LoginFlow struct {
 	Nonce         string
 	Verifier      string
 	CreatedAt     time.Time
-	Status        string // awaiting_discovery | discovering | awaiting_authorization | exchanging | authorized | failed | expired
+	Status        string // awaiting_discovery | discovering | awaiting_authorization | exchanging | authorized | failed | expired | cancelled
 	ErrorMsg      string
 	AuthorizeURL  string
 	ClientID      string
@@ -733,6 +769,8 @@ type LoginFlow struct {
 	Resource      string
 	Discovery     *DiscoveryData
 	ResultAccount *Account
+
+	cancelled bool
 }
 
 // NewLoginFlow initializes a fresh one-time PKCE desktop login flow.
@@ -759,24 +797,195 @@ func NewLoginFlow(provider, stage, region string, port int, appVersion string, o
 		Nonce:       randomURLToken(32),
 		Verifier:    randomURLToken(48),
 		CreatedAt:   time.Now(),
-		Status:      "awaiting_discovery",
+		Status:      flowAwaitingDiscovery,
 	}
 }
 
 // Challenge returns the PKCE S256 code_challenge derived from Verifier.
 func (f *LoginFlow) Challenge() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.challengeLocked()
+}
+
+func (f *LoginFlow) challengeLocked() string {
 	sum := sha256.Sum256([]byte(f.Verifier))
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 // LoginURL returns the Step 1 Amazon Quick discovery URL to open in a browser.
 func (f *LoginFlow) LoginURL() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loginURLLocked()
+}
+
+func (f *LoginFlow) loginURLLocked() string {
 	return DiscoveryURL(f.Provider, f.Stage, f.Region, f.Nonce, f.Port, f.AppVersion, f.Overrides)
+}
+
+// expireIfStale marks a flow that is still waiting on the user as expired once its TTL
+// has elapsed, and reports whether the flow is expired. In-flight steps (discovering,
+// exchanging) are left to finish so a valid code is not thrown away.
+func (f *LoginFlow) expireIfStale(now time.Time) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.expireIfStaleLocked(now)
+}
+
+func (f *LoginFlow) expireIfStaleLocked(now time.Time) bool {
+	switch f.Status {
+	case flowAwaitingDiscovery, flowAwaitingAuthorization:
+		if now.Sub(f.CreatedAt) > loginFlowTTL {
+			f.Status = flowExpired
+			f.ErrorMsg = "授权链接已过期，请重新发起登录"
+		}
+	}
+	return f.Status == flowExpired
+}
+
+// usableErrLocked rejects operations on cancelled, expired, failed or completed flows.
+func (f *LoginFlow) usableErrLocked() error {
+	if f.cancelled {
+		return &StepError{Status: 409, Message: "登录会话已取消"}
+	}
+	if f.expireIfStaleLocked(time.Now()) {
+		return &StepError{Status: 410, Message: f.ErrorMsg}
+	}
+	switch f.Status {
+	case flowAuthorized:
+		return &StepError{Status: 409, Message: "该登录会话已完成授权"}
+	case flowFailed:
+		return &StepError{Status: 409, Message: firstNonEmpty(f.ErrorMsg, "登录会话已失败，请重新发起登录")}
+	}
+	return nil
+}
+
+func (f *LoginFlow) failLocked(status int, msg string) error {
+	f.Status = flowFailed
+	f.ErrorMsg = msg
+	return &StepError{Status: status, Message: msg}
+}
+
+// cancel marks the flow cancelled so in-flight steps discard their results.
+func (f *LoginFlow) cancel() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Status == flowAuthorized {
+		return
+	}
+	f.cancelled = true
+	f.Status = flowCancelled
+	f.ErrorMsg = "登录已取消"
+	f.State = ""
+	f.Verifier = ""
+}
+
+// matchesSecret reports whether secret equals the flow's live nonce (isNonce) or state.
+func (f *LoginFlow) matchesSecret(secret string, isNonce bool) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cancelled {
+		return false
+	}
+	target := f.State
+	if isNonce {
+		target = f.Nonce
+	}
+	return sameSecret(secret, target)
 }
 
 // ProcessDiscovery validates the Step 1 callback query, registers an IdC public client if needed,
 // and returns the Step 2 AWS authorize URL.
 func (f *LoginFlow) ProcessDiscovery(ctx context.Context, client *http.Client, q url.Values) (string, error) {
+	f.mu.Lock()
+	// Validate nonce before honouring any other parameter (including error=).
+	if !sameSecret(q.Get("nonce"), f.Nonce) {
+		f.mu.Unlock()
+		return "", &StepError{Status: 400, Message: "授权发现 nonce 校验失败"}
+	}
+	if err := f.usableErrLocked(); err != nil {
+		f.mu.Unlock()
+		return "", err
+	}
+	switch f.Status {
+	case flowAwaitingDiscovery:
+	case flowAwaitingAuthorization:
+		// Idempotent replay of an already-completed discovery step.
+		u := f.AuthorizeURL
+		f.mu.Unlock()
+		return u, nil
+	case flowDiscovering:
+		f.mu.Unlock()
+		return "", &StepError{Status: 409, Message: "授权发现正在进行中，请稍候"}
+	default:
+		f.mu.Unlock()
+		return "", &StepError{Status: 409, Message: "登录会话已进入下一步，请勿重复提交授权发现回调"}
+	}
+	if errParam := strings.TrimSpace(q.Get("error")); errParam != "" {
+		msg := strings.TrimSpace("登录失败: " + errParam + " " + strings.TrimSpace(q.Get("error_description")))
+		err := f.failLocked(400, msg)
+		f.mu.Unlock()
+		return "", err
+	}
+	f.Status = flowDiscovering
+	in := discoveryInput{
+		provider:  f.Provider,
+		stage:     f.Stage,
+		region:    f.Region,
+		port:      f.Port,
+		overrides: f.Overrides,
+		state:     f.State,
+		challenge: f.challengeLocked(),
+	}
+	f.mu.Unlock()
+
+	res, err := runDiscovery(ctx, client, q, in)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cancelled {
+		return "", &StepError{Status: 409, Message: "登录会话已取消"}
+	}
+	if f.Status != flowDiscovering {
+		return "", &StepError{Status: 409, Message: firstNonEmpty(f.ErrorMsg, "登录会话状态已变化，请重新发起登录")}
+	}
+	if err != nil {
+		f.Status = flowFailed
+		f.ErrorMsg = err.Error()
+		return "", err
+	}
+	f.Provider = res.provider
+	f.RedirectURI = res.redirectURI
+	f.ClientID = res.clientID
+	f.ClientSecret = res.clientSecret
+	f.Resource = res.resource
+	f.Discovery = res.discovery
+	f.AuthorizeURL = res.authorizeURL
+	f.Status = flowAwaitingAuthorization
+	f.ErrorMsg = ""
+	return f.AuthorizeURL, nil
+}
+
+type discoveryInput struct {
+	provider, stage, region string
+	port                    int
+	overrides               EndpointOverrides
+	state, challenge        string
+}
+
+type discoveryResult struct {
+	provider     string
+	redirectURI  string
+	clientID     string
+	clientSecret string
+	resource     string
+	authorizeURL string
+	discovery    *DiscoveryData
+}
+
+// runDiscovery performs the network part of Step 1 without touching the flow.
+func runDiscovery(ctx context.Context, client *http.Client, q url.Values, in discoveryInput) (discoveryResult, error) {
 	pick := func(keys ...string) string {
 		for _, k := range keys {
 			if v := strings.TrimSpace(q.Get(k)); v != "" {
@@ -785,79 +994,59 @@ func (f *LoginFlow) ProcessDiscovery(ctx context.Context, client *http.Client, q
 		}
 		return ""
 	}
-	if !sameSecret(q.Get("nonce"), f.Nonce) {
-		return "", &StepError{Status: 400, Message: "授权发现 nonce 校验失败"}
-	}
-	if errParam := pick("error"); errParam != "" {
-		msg := strings.TrimSpace("登录失败: " + errParam + " " + pick("error_description"))
-		f.Status = "failed"
-		f.ErrorMsg = msg
-		return "", &StepError{Status: 400, Message: msg}
-	}
-	if f.AuthorizeURL != "" {
-		return f.AuthorizeURL, nil
-	}
-	f.Status = "discovering"
-
-	allowCustom := f.Overrides.hasCustom()
+	var res discoveryResult
+	allowCustom := in.overrides.hasCustom()
 	isGateway := q.Has("namespace") && strings.TrimSpace(q.Get("namespace")) != ""
 	issuerURL := pick("issuerUrl", "issuer_url", "issuer")
 
 	// Branch A: Personal Social IdC (dynamic public client registration)
-	if !isGateway && !IsEnterpriseDiscovery(f.Provider) && issuerURL != "" {
+	if !isGateway && !IsEnterpriseDiscovery(in.provider) && issuerURL != "" {
 		if _, err := ValidateTrustedURL(issuerURL, allowCustom); err != nil {
-			f.Status = "failed"
-			f.ErrorMsg = err.Error()
-			return "", err
+			return res, err
 		}
 		idcRegion := pick("idcRegion", "idc_region")
 		if idcRegion == "" {
-			idcRegion = f.Region
+			idcRegion = in.region
 		}
 		if idcRegion == "" {
 			idcRegion = "us-east-1"
 		}
 		if !allowCustom && !regionRE.MatchString(idcRegion) {
-			f.Status = "failed"
-			f.ErrorMsg = "IdC 区域无效"
-			return "", &StepError{Status: 400, Message: f.ErrorMsg}
+			return res, &StepError{Status: 400, Message: "IdC 区域无效"}
 		}
 		tenantURL := pick("tenantUrl", "tenant_url")
 		if tenantURL != "" {
 			if _, err := ValidateTrustedURL(tenantURL, allowCustom); err != nil {
-				f.Status = "failed"
-				f.ErrorMsg = err.Error()
-				return "", err
+				return res, err
 			}
 		}
-		f.RedirectURI = fmt.Sprintf("http://127.0.0.1:%d", f.Port)
-		oidcEP := oidcBaseURL(idcRegion, f.Overrides)
+		res.redirectURI = fmt.Sprintf("http://127.0.0.1:%d", in.port)
+		oidcEP := oidcBaseURL(idcRegion, in.overrides)
+		if _, err := ValidateTrustedURL(oidcEP, allowCustom); err != nil {
+			return res, err
+		}
 		regResp, err := doJSONRequest(ctx, client, http.MethodPost, oidcEP+"/client/register", map[string]any{
 			"clientName":   "AmazonQuick-Desktop",
 			"clientType":   "public",
-			"scopes":       scopesForStage(f.Stage),
+			"scopes":       scopesForStage(in.stage),
 			"grantTypes":   []string{"authorization_code", "refresh_token"},
-			"redirectUris": []string{f.RedirectURI},
+			"redirectUris": []string{res.redirectURI},
 			"issuerUrl":    issuerURL,
 		}, nil)
 		if err != nil {
-			f.Status = "failed"
-			f.ErrorMsg = fmt.Sprintf("AWS IdC 客户端注册失败: %v", err)
-			return "", &StepError{Status: 502, Message: f.ErrorMsg}
+			return res, &StepError{Status: 502, Message: fmt.Sprintf("AWS IdC 客户端注册失败: %v", err)}
 		}
-		f.ClientID = firstString(regResp, "clientId", "client_id")
-		f.ClientSecret = firstString(regResp, "clientSecret", "client_secret")
-		if f.ClientID == "" {
-			f.Status = "failed"
-			f.ErrorMsg = "AWS IdC 客户端注册未返回 clientId"
-			return "", &StepError{Status: 502, Message: f.ErrorMsg}
+		res.clientID = firstString(regResp, "clientId", "client_id")
+		res.clientSecret = firstString(regResp, "clientSecret", "client_secret")
+		if res.clientID == "" {
+			return res, &StepError{Status: 502, Message: "AWS IdC 客户端注册未返回 clientId"}
 		}
 		var secExp int64
 		if v, ok := regResp["clientSecretExpiresAt"].(float64); ok {
 			secExp = int64(v)
 		}
-		f.Provider = ProviderSocial
-		f.Discovery = &DiscoveryData{
+		res.provider = ProviderSocial
+		res.discovery = &DiscoveryData{
 			AuthEndpoint:          oidcEP + "/authorize",
 			TokenEndpoint:         oidcEP + "/token",
 			IssuerURL:             issuerURL,
@@ -868,17 +1057,16 @@ func (f *LoginFlow) ProcessDiscovery(ctx context.Context, client *http.Client, q
 		}
 		params := url.Values{
 			"response_type":         {"code"},
-			"client_id":             {f.ClientID},
-			"redirect_uri":          {f.RedirectURI},
-			"scope":                 {strings.Join(scopesForStage(f.Stage), " ")},
-			"state":                 {f.State},
-			"code_challenge":        {f.Challenge()},
+			"client_id":             {res.clientID},
+			"redirect_uri":          {res.redirectURI},
+			"scope":                 {strings.Join(scopesForStage(in.stage), " ")},
+			"state":                 {in.state},
+			"code_challenge":        {in.challenge},
 			"code_challenge_method": {"S256"},
 			"prompt":                {"login"},
 		}
-		f.AuthorizeURL = appendQueryParams(f.Discovery.AuthEndpoint, params)
-		f.Status = "awaiting_authorization"
-		return f.AuthorizeURL, nil
+		res.authorizeURL = appendQueryParams(res.discovery.AuthEndpoint, params)
+		return res, nil
 	}
 
 	// Branch B: Enterprise / Gateway / Social Gateway
@@ -886,46 +1074,37 @@ func (f *LoginFlow) ProcessDiscovery(ctx context.Context, client *http.Client, q
 	tokenEP := pick("tokenEndpoint", "token_endpoint")
 	tenantURL := pick("tenantUrl", "tenant_url")
 	if authEP == "" || tokenEP == "" {
-		f.Status = "failed"
-		f.ErrorMsg = "授权发现缺少 authEndpoint 或 tokenEndpoint"
-		return "", &StepError{Status: 400, Message: f.ErrorMsg}
+		return res, &StepError{Status: 400, Message: "授权发现缺少 authEndpoint 或 tokenEndpoint"}
 	}
 	for _, ep := range []string{authEP, tokenEP} {
 		if _, err := ValidateTrustedURL(ep, allowCustom); err != nil {
-			f.Status = "failed"
-			f.ErrorMsg = err.Error()
-			return "", err
+			return res, err
 		}
 	}
 	if tenantURL != "" {
 		if _, err := ValidateTrustedURL(tenantURL, allowCustom); err != nil {
-			f.Status = "failed"
-			f.ErrorMsg = err.Error()
-			return "", err
+			return res, err
 		}
 	}
-	f.ClientID = pick("clientId", "client_id")
-	f.ClientSecret = pick("clientSecret", "client_secret")
-	if f.ClientID == "" {
-		f.Status = "failed"
-		f.ErrorMsg = "授权发现缺少 clientId"
-		return "", &StepError{Status: 400, Message: f.ErrorMsg}
+	res.clientID = pick("clientId", "client_id")
+	res.clientSecret = pick("clientSecret", "client_secret")
+	if res.clientID == "" {
+		return res, &StepError{Status: 400, Message: "授权发现缺少 clientId"}
 	}
-	if isGateway {
-		if f.Provider == ProviderSocial {
-			f.Provider = ProviderSocialGateway
-		} else {
-			f.Provider = ProviderGateway
-		}
-	} else {
-		f.Provider = ProviderEnterprise
+	switch {
+	case isGateway && in.provider == ProviderSocial:
+		res.provider = ProviderSocialGateway
+	case isGateway:
+		res.provider = ProviderGateway
+	default:
+		res.provider = ProviderEnterprise
 	}
-	f.RedirectURI = fmt.Sprintf("http://localhost:%d", f.Port)
-	f.Resource = pick("resource")
-	if f.Resource == "" {
-		f.Resource = ResourceFor(tenantURL)
+	res.redirectURI = fmt.Sprintf("http://localhost:%d", in.port)
+	res.resource = pick("resource")
+	if res.resource == "" {
+		res.resource = ResourceFor(tenantURL)
 	}
-	f.Discovery = &DiscoveryData{
+	res.discovery = &DiscoveryData{
 		AuthEndpoint:  authEP,
 		TokenEndpoint: tokenEP,
 		IssuerURL:     issuerURL,
@@ -936,119 +1115,182 @@ func (f *LoginFlow) ProcessDiscovery(ctx context.Context, client *http.Client, q
 	meta := fetchServerMetadata(ctx, client, authEP)
 	params := url.Values{
 		"response_type":         {"code"},
-		"client_id":             {f.ClientID},
-		"redirect_uri":          {f.RedirectURI},
-		"scope":                 {enterpriseScopeFromMetadata(meta, f.ClientSecret != "")},
-		"state":                 {f.State},
-		"code_challenge":        {f.Challenge()},
+		"client_id":             {res.clientID},
+		"redirect_uri":          {res.redirectURI},
+		"scope":                 {enterpriseScopeFromMetadata(meta, res.clientSecret != "")},
+		"state":                 {in.state},
+		"code_challenge":        {in.challenge},
 		"code_challenge_method": {"S256"},
 	}
-	if f.ClientSecret != "" {
+	if res.clientSecret != "" {
 		params.Set("access_type", "offline")
 		params.Set("prompt", "consent")
 	}
-	if f.Resource != "" {
-		params.Set("resource", f.Resource)
+	if res.resource != "" {
+		params.Set("resource", res.resource)
 	}
-	f.AuthorizeURL = appendQueryParams(authEP, params)
-	f.Status = "awaiting_authorization"
-	return f.AuthorizeURL, nil
+	res.authorizeURL = appendQueryParams(authEP, params)
+	return res, nil
 }
 
 // Complete validates the Step 2 OAuth callback query, exchanges the authorization code for tokens,
 // fetches user-info, and returns the ready-to-save Account.
 func (f *LoginFlow) Complete(ctx context.Context, client *http.Client, q url.Values) (*Account, error) {
-	if errParam := strings.TrimSpace(q.Get("error")); errParam != "" {
-		msg := strings.TrimSpace("授权被取消或失败: " + errParam + " " + q.Get("error_description"))
-		f.Status = "failed"
-		f.ErrorMsg = msg
-		return nil, &StepError{Status: 400, Message: msg}
+	return f.complete(ctx, client, q, nil)
+}
+
+// complete is Complete with an optional save hook. save runs while the flow is locked,
+// after the cancellation check, so a concurrent Cancel either wins (nothing is saved) or
+// happens after the account has been fully saved.
+func (f *LoginFlow) complete(ctx context.Context, client *http.Client, q url.Values, save LoginResultHandler) (*Account, error) {
+	f.mu.Lock()
+	// Validate the CSRF state before honouring any other parameter (including error=), so a
+	// forged callback cannot fail somebody else's login.
+	if !sameSecret(q.Get("state"), f.State) {
+		f.mu.Unlock()
+		return nil, &StepError{Status: 400, Message: "OAuth state 校验失败"}
 	}
-	if f.AuthorizeURL == "" || f.Discovery == nil {
+	if err := f.usableErrLocked(); err != nil {
+		f.mu.Unlock()
+		return nil, err
+	}
+	if f.Status != flowAwaitingAuthorization || f.AuthorizeURL == "" || f.Discovery == nil {
+		f.mu.Unlock()
 		return nil, &StepError{Status: 400, Message: "尚未完成第一步授权发现"}
 	}
-	if !sameSecret(q.Get("state"), f.State) {
-		return nil, &StepError{Status: 400, Message: "OAuth state 校验失败"}
+	if errParam := strings.TrimSpace(q.Get("error")); errParam != "" {
+		msg := strings.TrimSpace("授权被取消或失败: " + errParam + " " + strings.TrimSpace(q.Get("error_description")))
+		f.State = ""
+		err := f.failLocked(400, msg)
+		f.mu.Unlock()
+		return nil, err
 	}
 	code := strings.TrimSpace(q.Get("code"))
 	if code == "" {
+		f.mu.Unlock()
 		return nil, &StepError{Status: 400, Message: "OAuth 回调缺少 code 参数"}
 	}
+	// CAS awaiting_authorization -> exchanging and consume the one-time state: any concurrent
+	// or replayed callback now fails state validation and cannot redeem the code again.
+	f.Status = flowExchanging
+	f.State = ""
+	in := exchangeInput{
+		provider:     f.Provider,
+		stage:        f.Stage,
+		region:       f.Region,
+		clientID:     f.ClientID,
+		clientSecret: f.ClientSecret,
+		redirectURI:  f.RedirectURI,
+		verifier:     f.Verifier,
+		resource:     f.Resource,
+		discovery:    *f.Discovery,
+		overrides:    f.Overrides,
+	}
+	f.mu.Unlock()
 
-	f.Status = "exchanging"
-	var (
-		raw map[string]any
-		err error
-	)
-	if f.Provider == ProviderSocial && f.Discovery.IDCRegion != "" {
-		raw, err = doJSONRequest(ctx, client, http.MethodPost, f.Discovery.TokenEndpoint, map[string]any{
-			"clientId":     f.ClientID,
-			"clientSecret": f.ClientSecret,
-			"grantType":    "authorization_code",
-			"code":         code,
-			"redirectUri":  f.RedirectURI,
-			"codeVerifier": f.Verifier,
-		}, nil)
-	} else {
-		form := url.Values{
-			"grant_type":    {"authorization_code"},
-			"code":          {code},
-			"redirect_uri":  {f.RedirectURI},
-			"client_id":     {f.ClientID},
-			"code_verifier": {f.Verifier},
-		}
-		if f.ClientSecret != "" {
-			form.Set("client_secret", f.ClientSecret)
-		}
-		if f.Resource != "" {
-			form.Set("resource", f.Resource)
-		}
-		raw, err = doFormRequest(ctx, client, f.Discovery.TokenEndpoint, form)
+	acct, err := exchangeAuthorizationCode(ctx, client, code, in)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cancelled {
+		return nil, &StepError{Status: 409, Message: "登录会话已取消，账号未保存"}
+	}
+	if f.Status != flowExchanging {
+		return nil, &StepError{Status: 409, Message: firstNonEmpty(f.ErrorMsg, "登录会话状态已变化，请重新发起登录")}
 	}
 	if err != nil {
-		f.Status = "failed"
-		f.ErrorMsg = fmt.Sprintf("令牌交换失败: %v", err)
-		return nil, &StepError{Status: 502, Message: f.ErrorMsg}
-	}
-	tokens := parseTokens(raw)
-	if tokens.AccessToken == "" && tokens.IDToken == "" {
-		f.Status = "failed"
-		f.ErrorMsg = "令牌交换未返回 access_token"
-		return nil, &StepError{Status: 502, Message: f.ErrorMsg}
-	}
-	info, err := FetchUserInfo(ctx, client, f.Provider, f.Stage, f.Discovery.TenantURL, tokens.AccessToken, f.Overrides)
-	if err != nil {
-		f.Status = "failed"
-		f.ErrorMsg = fmt.Sprintf("获取用户信息失败: %v", err)
-		return nil, &StepError{Status: 502, Message: f.ErrorMsg}
-	}
-	base := &Account{
-		Provider:              f.Provider,
-		Stage:                 f.Stage,
-		Region:                firstNonEmpty(f.Discovery.Region, f.Region),
-		IDCRegion:             f.Discovery.IDCRegion,
-		TenantURL:             f.Discovery.TenantURL,
-		Namespace:             f.Discovery.Namespace,
-		IssuerURL:             f.Discovery.IssuerURL,
-		TokenEndpoint:         f.Discovery.TokenEndpoint,
-		RedirectURI:           f.RedirectURI,
-		ClientID:              f.ClientID,
-		ClientSecret:          f.ClientSecret,
-		ClientSecretExpiresAt: f.Discovery.ClientSecretExpiresAt,
-	}
-	acct, err := buildAccountFromTokens(base, tokens, info, f.Overrides)
-	if err != nil {
-		f.Status = "failed"
+		f.Status = flowFailed
 		f.ErrorMsg = err.Error()
-		return nil, &StepError{Status: 502, Message: err.Error()}
+		return nil, err
+	}
+	if save != nil {
+		if serr := save(acct); serr != nil {
+			return nil, f.failLocked(500, "保存账号失败: "+serr.Error())
+		}
 	}
 	f.ResultAccount = acct
-	f.Status = "authorized"
+	f.Status = flowAuthorized
 	f.ErrorMsg = ""
 	// Clear one-time secrets promptly after completion.
 	f.Verifier = ""
 	f.Nonce = ""
 	f.State = ""
+	return acct, nil
+}
+
+type exchangeInput struct {
+	provider     string
+	stage        string
+	region       string
+	clientID     string
+	clientSecret string
+	redirectURI  string
+	verifier     string
+	resource     string
+	discovery    DiscoveryData
+	overrides    EndpointOverrides
+}
+
+// exchangeAuthorizationCode redeems code at the token endpoint and builds the Account.
+func exchangeAuthorizationCode(ctx context.Context, client *http.Client, code string, in exchangeInput) (*Account, error) {
+	var (
+		raw map[string]any
+		err error
+	)
+	if useOIDCJSONTokenEndpoint(in.provider, in.discovery.IDCRegion, in.discovery.TokenEndpoint) {
+		raw, err = doJSONRequest(ctx, client, http.MethodPost, in.discovery.TokenEndpoint, map[string]any{
+			"clientId":     in.clientID,
+			"clientSecret": in.clientSecret,
+			"grantType":    "authorization_code",
+			"code":         code,
+			"redirectUri":  in.redirectURI,
+			"codeVerifier": in.verifier,
+		}, nil)
+	} else {
+		form := url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {code},
+			"redirect_uri":  {in.redirectURI},
+			"client_id":     {in.clientID},
+			"code_verifier": {in.verifier},
+		}
+		if in.clientSecret != "" {
+			form.Set("client_secret", in.clientSecret)
+		}
+		if in.resource != "" {
+			form.Set("resource", in.resource)
+		}
+		raw, err = doFormRequest(ctx, client, in.discovery.TokenEndpoint, form)
+	}
+	if err != nil {
+		return nil, &StepError{Status: 502, Message: fmt.Sprintf("令牌交换失败: %v", err)}
+	}
+	tokens := parseTokens(raw)
+	if tokens.AccessToken == "" && tokens.IDToken == "" {
+		return nil, &StepError{Status: 502, Message: "令牌交换未返回 access_token"}
+	}
+	info, err := FetchUserInfo(ctx, client, in.provider, in.stage, in.discovery.TenantURL, tokens.AccessToken, in.overrides)
+	if err != nil {
+		return nil, &StepError{Status: 502, Message: fmt.Sprintf("获取用户信息失败: %v", err)}
+	}
+	base := &Account{
+		Provider:              in.provider,
+		Stage:                 in.stage,
+		Region:                firstNonEmpty(in.discovery.Region, in.region),
+		IDCRegion:             in.discovery.IDCRegion,
+		TenantURL:             in.discovery.TenantURL,
+		Namespace:             in.discovery.Namespace,
+		IssuerURL:             in.discovery.IssuerURL,
+		TokenEndpoint:         in.discovery.TokenEndpoint,
+		RedirectURI:           in.redirectURI,
+		ClientID:              in.clientID,
+		ClientSecret:          in.clientSecret,
+		ClientSecretExpiresAt: in.discovery.ClientSecretExpiresAt,
+	}
+	acct, err := buildAccountFromTokens(base, tokens, info, in.overrides)
+	if err != nil {
+		return nil, &StepError{Status: 502, Message: err.Error()}
+	}
 	return acct, nil
 }
 

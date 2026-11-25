@@ -12,35 +12,54 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - name: Determine and validate version tag
+        id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid release tag format: ${TAG} (expected vX.Y.Z or vX.Y.Z-prerelease)"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
+          ref: refs/tags/${{ steps.meta.outputs.tag }}
           fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
-      - name: Determine version tag
-        id: meta
+      - name: Run checks and tests
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
-          else
-            TAG="${GITHUB_REF_NAME}"
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "${unformatted}" ]; then
+            echo "The following Go files are not gofmt-formatted:"
+            echo "${unformatted}"
+            exit 1
           fi
-          VERSION="${TAG#v}"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Run checks and tests
-        run: |
           CGO_ENABLED=0 go vet ./...
           go test -race -count=1 ./...
           node --check internal/panel/web/app.js
@@ -64,13 +83,18 @@ jobs:
           ls -lh release-assets
 
       - name: Create or update GitHub Release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.meta.outputs.tag }}
         run: |
-          cat > release-notes.md <<'EOF'
-          ## AWSQuick2API ${TAG}
-
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            # Preserve existing (possibly customized) release notes; only refresh assets.
+            gh release upload "${TAG}" release-assets/* --clobber
+          else
+            printf '## AWSQuick2API %s\n\n' "${TAG}" > release-notes.md
+            cat >> release-notes.md <<'EOF'
           ### 下载文件
           | 文件 | 平台 | 说明 |
           | --- | --- | --- |
@@ -87,12 +111,6 @@ jobs:
           2. 浏览器访问 `http://127.0.0.1:8045/panel/`，输入 `config.json` 中的 `admin_key` 解锁并添加账号。
           3. 在客户端中填写 `http://127.0.0.1:8045` 和 `config.json` 中的 `api_key` 即可使用。
           EOF
-          sed -i "s/\${TAG}/${TAG}/g" release-notes.md
-
-          if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" release-assets/* --clobber
-            gh release edit "${TAG}" --notes-file release-notes.md
-          else
             gh release create "${TAG}" release-assets/* \
               --title "AWSQuick2API ${TAG}" \
               --notes-file release-notes.md \

@@ -31,6 +31,19 @@
       .replace(/"/g, "&quot;");
   }
 
+  // safeExternalURL only lets absolute http(s) URLs through to an <a>.href;
+  // anything else (javascript:, data:, vbscript:, relative junk) becomes "#".
+  function safeExternalURL(raw) {
+    if (typeof raw !== "string" || !raw.trim()) return "#";
+    try {
+      const u = new URL(raw.trim());
+      if (u.protocol === "http:" || u.protocol === "https:") return u.href;
+    } catch {
+      /* invalid URL */
+    }
+    return "#";
+  }
+
   async function api(path, opts = {}) {
     const headers = { ...(opts.headers || {}), Authorization: `Bearer ${adminKey}` };
     if (opts.body !== undefined && !headers["Content-Type"]) {
@@ -192,7 +205,7 @@
   function closeModal(id) {
     $(id).classList.add("hidden");
     if (id === "modal-login") {
-      stopLoginPoll();
+      cancelActiveLogin();
     }
   }
 
@@ -207,7 +220,7 @@
 
   async function loadOverview() {
     const data = await api("/panel/api/overview");
-    $("version-badge").textContent = "v" + (data.version || "0.1.0");
+    $("version-badge").textContent = "v" + (data.version || "0.1.2");
     $("proto-pill").textContent = `Quick ${data.app_version || "1.2.4660"}`;
 
     const pool = data.pool || {};
@@ -231,6 +244,17 @@
     const activePorts = Array.isArray(data.active_cb_ports) && data.active_cb_ports.length ? data.active_cb_ports.join(",") : `${data.callback_port || 18080} (按需)`;
     const proxyLabel = data.proxy_configured ? " · 已配置出口代理" : " · 直连";
     $("stat-cb").textContent = `OAuth 回调 :${activePorts}${proxyLabel}`;
+    renderPrivacyToggle(!!data.strict_privacy_dlp);
+  }
+
+  function renderPrivacyToggle(on) {
+    const btn = $("btn-toggle-privacy-dlp");
+    if (!btn) return;
+    btn.classList.toggle("on", on);
+    btn.classList.toggle("off", !on);
+    btn.dataset.enabled = on ? "1" : "0";
+    btn.setAttribute("aria-checked", on ? "true" : "false");
+    btn.querySelector(".switch-label").textContent = on ? "已启用" : "已关闭";
   }
 
   function renderQuotaCell(q) {
@@ -376,10 +400,19 @@
     }
   }
 
+  function cancelActiveLogin() {
+    stopLoginPoll();
+    const id = activeLoginId;
+    activeLoginId = "";
+    if (id) {
+      api(`/panel/api/login/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
+    }
+  }
+
   function updateLoginUI(view) {
     $("login-active-box").classList.remove("hidden");
     $("login-url-input").value = view.login_url || "";
-    $("login-url-open").href = view.login_url || "#";
+    $("login-url-open").href = safeExternalURL(view.login_url);
     const statusMap = {
       awaiting_discovery: ["等待第 1 步：打开登录链接并在浏览器完成账号登录...", "warn"],
       discovering: ["正在与 AWS OIDC 交换发现信息...", "info"],
@@ -388,6 +421,7 @@
       authorized: [`登录成功：${view.account_label || view.account_uid}`, "ok"],
       failed: [`登录失败：${view.error || "未知错误"}`, "err"],
       expired: ["授权链接已过期，请重新生成", "err"],
+      cancelled: ["登录会话已取消", "warn"],
     };
     const [txt, cls] = statusMap[view.status] || [view.status, "warn"];
     $("login-status-text").textContent = txt;
@@ -398,19 +432,21 @@
     if (view.authorize_url) {
       $("login-authz-wrap").classList.remove("hidden");
       $("login-authz-input").value = view.authorize_url;
-      $("login-authz-open").href = view.authorize_url;
+      $("login-authz-open").href = safeExternalURL(view.authorize_url);
     } else {
       $("login-authz-wrap").classList.add("hidden");
     }
 
     if (view.status === "authorized") {
       stopLoginPoll();
+      activeLoginId = "";
       $("login-msg").textContent = `账号 ${view.account_label || view.account_uid} 已加密保存并加入账号池！建议点击“测试”验证连通性。`;
       $("login-msg").classList.remove("hidden");
       $("login-err").classList.add("hidden");
       loadAll();
-    } else if (view.status === "failed" || view.status === "expired") {
+    } else if (view.status === "failed" || view.status === "expired" || view.status === "cancelled") {
       stopLoginPoll();
+      activeLoginId = "";
       $("login-err").textContent = view.error || txt;
       $("login-err").classList.remove("hidden");
     }
@@ -425,7 +461,7 @@
   });
 
   $("btn-login-start").addEventListener("click", async () => {
-    stopLoginPoll();
+    cancelActiveLogin();
     $("login-msg").classList.add("hidden");
     $("login-err").classList.add("hidden");
     try {
@@ -613,11 +649,15 @@
       if (!newID) return;
       const newDisp = prompt("新的展示名称（可选）:", renBtn.dataset.curDisp || newID);
       try {
-        await api(`/panel/api/models/${encodeURIComponent(renBtn.dataset.renameSlot)}/rename`, {
+        const res = await api(`/panel/api/models/${encodeURIComponent(renBtn.dataset.renameSlot)}/rename`, {
           method: "PUT",
           body: { id: newID, display: newDisp || newID },
         });
-        showToast("模型名称已保存至 models.json");
+        if (res.config_sync_error) {
+          showToast(`模型名称已保存至 models.json，但同步 config.json 失败：${res.config_sync_error}`, true);
+        } else {
+          showToast("模型名称已保存至 models.json");
+        }
         await loadModels();
       } catch (err) { showToast(err.message, true); }
     }
@@ -628,6 +668,16 @@
     try {
       await api("/panel/api/models/claude-aliases", { method: "PATCH", body: { enabled: next } });
       await loadModels();
+    } catch (e) { showToast(e.message, true); }
+  });
+
+  $("btn-toggle-privacy-dlp").addEventListener("click", async () => {
+    const next = $("btn-toggle-privacy-dlp").dataset.enabled !== "1";
+    if (!next && !confirm("关闭严格隐私脱敏后，上游回复中的账号邮箱等信息可能直接返回给调用方，确定关闭？")) return;
+    try {
+      await api("/panel/api/features/strict-privacy-dlp", { method: "PATCH", body: { enabled: next } });
+      renderPrivacyToggle(next);
+      showToast(next ? "已启用严格隐私脱敏" : "已关闭严格隐私脱敏");
     } catch (e) { showToast(e.message, true); }
   });
 

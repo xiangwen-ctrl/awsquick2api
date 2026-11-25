@@ -7,9 +7,10 @@
 从 [GitHub Releases](https://github.com/xiangwen-ctrl/awsquick2api/releases) 下载对应架构的二进制文件：
 
 ```bash
-sudo mkdir -p /opt/awsquick2api
-sudo cp awsquick2api-linux-amd64 /opt/awsquick2api/awsquick2api
-sudo chmod +x /opt/awsquick2api/awsquick2api
+sudo useradd --system --home-dir /opt/awsquick2api --shell /usr/sbin/nologin awsquick2api
+sudo install -d -o awsquick2api -g awsquick2api -m 0700 /opt/awsquick2api
+sudo install -o awsquick2api -g awsquick2api -m 0755 awsquick2api-linux-amd64 /opt/awsquick2api/awsquick2api
+sudo chown -R awsquick2api:awsquick2api /opt/awsquick2api
 
 sudo cp deploy/linux/awsquick2api.service /etc/systemd/system/awsquick2api.service
 sudo systemctl daemon-reload
@@ -48,8 +49,8 @@ ssh -L 8045:127.0.0.1:8045 user@YOUR_SERVER
 # 本机导出加密迁移包（输入 ≥ 12 位密码）
 ./awsquick2api -export-encrypted ./accounts.enc.json
 
-# 上传到服务器后导入（也可直接在面板「导入」上传）
-/opt/awsquick2api/awsquick2api -config /opt/awsquick2api/config.json -import-encrypted ./accounts.enc.json
+# 上传到服务器后以服务用户导入（避免以 root 执行生成无权读取的凭据文件；也可直接在面板「导入」上传）
+sudo -u awsquick2api /opt/awsquick2api/awsquick2api -config /opt/awsquick2api/config.json -import-encrypted /tmp/accounts.enc.json
 ```
 
 ## 4. 从源码交叉编译

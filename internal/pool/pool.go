@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"awsquick2api/internal/auth"
+	"awsquick2api/internal/reqlog"
 )
 
 const (
@@ -35,24 +36,27 @@ type Config struct {
 
 // QuotaInfo holds normalized Amazon Quick subscription & usage quota data for one account.
 type QuotaInfo struct {
-	Known             bool    `json:"known"`
-	Plan              string  `json:"plan,omitempty"`
-	TrialUntil        int64   `json:"trial_until,omitempty"` // Unix ms
-	Unit              string  `json:"unit,omitempty"`        // "credits" | "agent_minutes"
-	MonthlyUsed       float64 `json:"monthly_used"`
-	MonthlyLimit      float64 `json:"monthly_limit"`
-	MonthlyPercent    float64 `json:"monthly_percent"`
-	MonthlyResetsAt   int64   `json:"monthly_resets_at,omitempty"`
-	OverageUsed       float64 `json:"overage_used,omitempty"`
-	OverageLimit      float64 `json:"overage_limit,omitempty"`
-	SessionUsed       float64 `json:"session_used"`
-	SessionLimit      float64 `json:"session_limit"`
-	SessionPercent    float64 `json:"session_percent"`
-	SessionResetsAt   int64   `json:"session_resets_at,omitempty"`
-	SessionResumeMin  float64 `json:"session_resume_min,omitempty"`
-	AdvancedEnabled   bool    `json:"advanced_enabled,omitempty"`
-	UpdatedAt         int64   `json:"updated_at,omitempty"`
-	UnavailableReason string  `json:"unavailable_reason,omitempty"`
+	Known            bool    `json:"known"`
+	Plan             string  `json:"plan,omitempty"`
+	TrialUntil       int64   `json:"trial_until,omitempty"` // Unix ms
+	Unit             string  `json:"unit,omitempty"`        // "credits" | "agent_minutes"
+	MonthlyUsed      float64 `json:"monthly_used"`
+	MonthlyLimit     float64 `json:"monthly_limit"`
+	MonthlyPercent   float64 `json:"monthly_percent"`
+	MonthlyResetsAt  int64   `json:"monthly_resets_at,omitempty"`
+	OverageUsed      float64 `json:"overage_used,omitempty"`
+	OverageLimit     float64 `json:"overage_limit,omitempty"`
+	SessionUsed      float64 `json:"session_used"`
+	SessionLimit     float64 `json:"session_limit"`
+	SessionPercent   float64 `json:"session_percent"`
+	SessionResetsAt  int64   `json:"session_resets_at,omitempty"`
+	SessionResumeMin float64 `json:"session_resume_min,omitempty"`
+	AdvancedEnabled  bool    `json:"advanced_enabled,omitempty"`
+	// AdvancedKnown marks AdvancedEnabled as an authoritative result of this update
+	// (e.g. CheckAdvanced succeeded). When false, UpdateQuota keeps the previous value.
+	AdvancedKnown     bool   `json:"advanced_known,omitempty"`
+	UpdatedAt         int64  `json:"updated_at,omitempty"`
+	UnavailableReason string `json:"unavailable_reason,omitempty"`
 }
 
 // RemainingFraction estimates remaining headroom in [0.05, 1.0] for weighted account selection.
@@ -61,16 +65,8 @@ func (q QuotaInfo) RemainingFraction() float64 {
 		return 0.5
 	}
 	rem := 1.0
-	if q.MonthlyLimit > 0 {
-		mRem := math.Max(0, (q.MonthlyLimit-q.MonthlyUsed)/q.MonthlyLimit)
-		if mRem < rem {
-			rem = mRem
-		}
-	} else if q.MonthlyPercent > 0 {
-		mRem := math.Max(0, (100-q.MonthlyPercent)/100)
-		if mRem < rem {
-			rem = mRem
-		}
+	if mRem, ok := q.monthlyRemaining(); ok && mRem < rem {
+		rem = mRem
 	}
 	if q.SessionLimit > 0 {
 		sRem := math.Max(0, (q.SessionLimit-q.SessionUsed)/q.SessionLimit)
@@ -87,6 +83,29 @@ func (q QuotaInfo) RemainingFraction() float64 {
 		return 0.05
 	}
 	return rem
+}
+
+// monthlyRemaining returns the remaining monthly headroom fraction, counting any
+// remaining overage allowance as additional capacity (monthly limit + overage limit).
+// ok is false when no monthly figures are known.
+func (q QuotaInfo) monthlyRemaining() (float64, bool) {
+	overageRoom := 0.0
+	if q.OverageLimit > 0 {
+		overageRoom = math.Max(0, q.OverageLimit-q.OverageUsed)
+	}
+	switch {
+	case q.MonthlyLimit > 0:
+		capacity := q.MonthlyLimit + math.Max(0, q.OverageLimit)
+		room := math.Max(0, q.MonthlyLimit-q.MonthlyUsed) + overageRoom
+		return math.Min(1, room/capacity), true
+	case q.MonthlyPercent > 0:
+		mRem := math.Max(0, (100-q.MonthlyPercent)/100)
+		if mRem == 0 && q.OverageLimit > 0 {
+			return overageRoom / q.OverageLimit, true
+		}
+		return mRem, true
+	}
+	return 0, false
 }
 
 // IsExhausted reports whether monthly (without remaining overage) or session quota is 100% spent.
@@ -390,12 +409,19 @@ func (p *Pool) UpdateAccount(updated *auth.Account) *auth.Account {
 	return e.acct.Clone()
 }
 
+// UpdateQuota replaces the cached quota snapshot for uid. AdvancedEnabled is taken
+// from q only when it is authoritative (q.AdvancedKnown, or a positive q.AdvancedEnabled);
+// otherwise the previous value is kept. UnavailableReason is credential-scrubbed.
 func (p *Pool) UpdateQuota(uid string, q QuotaInfo) {
+	q.UnavailableReason = reqlog.ScrubCredentials(q.UnavailableReason)
 	p.mu.Lock()
 	if e, ok := p.byUID[uid]; ok {
-		prevAdv := e.quota.AdvancedEnabled
-		if !q.AdvancedEnabled && prevAdv {
-			q.AdvancedEnabled = true
+		switch {
+		case q.AdvancedEnabled:
+			q.AdvancedKnown = true
+		case !q.AdvancedKnown:
+			q.AdvancedEnabled = e.quota.AdvancedEnabled
+			q.AdvancedKnown = e.quota.AdvancedKnown
 		}
 		e.quota = q
 		if q.Known && !q.IsExhausted() && e.cooldownReason == "quota_exhausted" {
@@ -403,15 +429,44 @@ func (p *Pool) UpdateQuota(uid string, q QuotaInfo) {
 			e.cooldownReason = ""
 		}
 		p.dirtyGen++
+		p.signalWaitersLocked()
 	}
 	p.mu.Unlock()
+}
+
+// MarkQuotaError records a transient quota-fetch failure for uid without discarding
+// the last cached quota snapshot; only UnavailableReason (credential-scrubbed) is set.
+func (p *Pool) MarkQuotaError(uid, reason string) {
+	reason = reqlog.ScrubCredentials(strings.TrimSpace(reason))
+	p.mu.Lock()
+	if e, ok := p.byUID[uid]; ok {
+		if !e.quota.Known && e.quota.UpdatedAt == 0 {
+			e.quota.UpdatedAt = time.Now().UnixMilli()
+		}
+		e.quota.UnavailableReason = reason
+		p.dirtyGen++
+	}
+	p.mu.Unlock()
+}
+
+// QuotaOf returns the cached quota snapshot for uid.
+func (p *Pool) QuotaOf(uid string) (QuotaInfo, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || e == nil {
+		return QuotaInfo{}, false
+	}
+	return e.quota, true
 }
 
 func (p *Pool) SetAdvancedEnabled(uid string, enabled bool) {
 	p.mu.Lock()
 	if e, ok := p.byUID[uid]; ok {
 		e.quota.AdvancedEnabled = enabled
+		e.quota.AdvancedKnown = true
 		p.dirtyGen++
+		p.signalWaitersLocked()
 	}
 	p.mu.Unlock()
 }
@@ -431,7 +486,7 @@ func (p *Pool) Disable(uid, reason string) {
 	p.mu.Lock()
 	if e, ok := p.byUID[uid]; ok {
 		e.disabled = true
-		e.disabledReason = strings.TrimSpace(reason)
+		e.disabledReason = reqlog.ScrubCredentials(strings.TrimSpace(reason))
 		p.dirtyGen++
 	}
 	p.mu.Unlock()
@@ -570,27 +625,60 @@ func (p *Pool) release(uid string) {
 	p.mu.Unlock()
 }
 
+// AcquireOptions configures AcquireWith.
+type AcquireOptions struct {
+	// PreferredUID is tried first (sticky sessions) when eligible and below MaxInFlight.
+	PreferredUID string
+	// Exclude lists account UIDs that must not be selected.
+	Exclude map[string]bool
+	// WaitTimeout bounds how long to wait for a free slot when all candidates are busy.
+	WaitTimeout time.Duration
+	// MaxWaiters caps concurrent waiters (0 = unlimited); beyond it ErrPoolBusy is returned.
+	MaxWaiters int
+	// RequireAdvanced restricts selection to accounts whose quota reports AdvancedEnabled.
+	// When no such account is eligible, ErrNoAdvancedAccounts is returned without waiting.
+	RequireAdvanced bool
+}
+
 // Acquire selects a healthy account with free concurrency capacity. If all healthy accounts
 // are currently at MaxInFlight, it waits up to waitTimeout (or ctx cancellation).
+// It is equivalent to AcquireWith with the corresponding options.
 func (p *Pool) Acquire(ctx context.Context, preferredUID string, exclude map[string]bool, waitTimeout time.Duration, maxWaiters int) (*Lease, error) {
-	deadline := time.Now().Add(waitTimeout)
+	return p.AcquireWith(ctx, AcquireOptions{
+		PreferredUID: preferredUID,
+		Exclude:      exclude,
+		WaitTimeout:  waitTimeout,
+		MaxWaiters:   maxWaiters,
+	})
+}
+
+// AcquireWith selects an account according to opts. Accounts whose cached quota is
+// exhausted are skipped while any non-exhausted candidate is eligible (even if that
+// candidate is busy, in which case it waits). Only when every eligible candidate is
+// exhausted does it fall back to them, because cached quota may be stale and upstream
+// remains the final authority (a real exhaustion then triggers MarkRateLimited).
+func (p *Pool) AcquireWith(ctx context.Context, opts AcquireOptions) (*Lease, error) {
+	deadline := time.Now().Add(opts.WaitTimeout)
 	for {
 		p.mu.Lock()
 		now := time.Now()
-		acct, anyEligible := p.pickLocked(now, preferredUID, exclude)
+		acct, anyEligible := p.pickLocked(now, opts)
 		if acct != nil {
 			p.mu.Unlock()
 			return &Lease{pool: p, Account: acct}, nil
 		}
 		if !anyEligible {
 			p.mu.Unlock()
+			if opts.RequireAdvanced {
+				return nil, ErrNoAdvancedAccounts
+			}
 			return nil, ErrNoHealthyAccounts
 		}
-		if waitTimeout <= 0 || time.Now().After(deadline) {
+		if opts.WaitTimeout <= 0 || time.Now().After(deadline) {
 			p.mu.Unlock()
 			return nil, ErrPoolBusy
 		}
-		if maxWaiters > 0 && p.waiters >= maxWaiters {
+		if opts.MaxWaiters > 0 && p.waiters >= opts.MaxWaiters {
 			p.mu.Unlock()
 			return nil, ErrPoolBusy
 		}
@@ -634,6 +722,18 @@ func (p *Pool) IsEligible(uid string) bool {
 	return p.isEligibleLocked(p.byUID[uid], time.Now())
 }
 
+// IsEligibleWith reports whether uid is enabled, not cooling down and, when
+// requireAdvanced is set, has advanced models enabled.
+func (p *Pool) IsEligibleWith(uid string, requireAdvanced bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.byUID[uid]
+	if !p.isEligibleLocked(e, time.Now()) {
+		return false
+	}
+	return !requireAdvanced || e.quota.AdvancedEnabled
+}
+
 func (p *Pool) isEligibleLocked(e *entry, now time.Time) bool {
 	if e == nil || e.acct == nil || e.disabled {
 		return false
@@ -648,34 +748,60 @@ func (p *Pool) isEligibleLocked(e *entry, now time.Time) bool {
 	return true
 }
 
-func (p *Pool) pickLocked(now time.Time, preferredUID string, exclude map[string]bool) (acct *auth.Account, anyEligible bool) {
-	if preferredUID != "" && !exclude[preferredUID] {
-		if e, ok := p.byUID[preferredUID]; ok && p.isEligibleLocked(e, now) {
-			anyEligible = true
-			if e.inFlight < p.cfg.MaxInFlight {
-				return p.claimLocked(e, now), true
-			}
-		}
-	}
-
-	var ready []*entry
+// pickLocked claims an account for opts. anyEligible reports whether at least one
+// candidate exists (so the caller should wait instead of failing) even if all are busy.
+func (p *Pool) pickLocked(now time.Time, opts AcquireOptions) (acct *auth.Account, anyEligible bool) {
+	var fresh, exhausted []*entry
 	for _, uid := range p.order {
-		if exclude[uid] {
+		if opts.Exclude[uid] {
 			continue
 		}
 		e := p.byUID[uid]
 		if !p.isEligibleLocked(e, now) {
 			continue
 		}
-		anyEligible = true
+		if opts.RequireAdvanced && !e.quota.AdvancedEnabled {
+			continue
+		}
+		if e.quota.IsExhausted() {
+			exhausted = append(exhausted, e)
+		} else {
+			fresh = append(fresh, e)
+		}
+	}
+	candidates := fresh
+	if len(candidates) == 0 {
+		candidates = exhausted
+	}
+	if len(candidates) == 0 {
+		return nil, false
+	}
+
+	if opts.PreferredUID != "" {
+		for _, e := range candidates {
+			if e.acct.UID == opts.PreferredUID {
+				if e.inFlight < p.cfg.MaxInFlight {
+					return p.claimLocked(e, now), true
+				}
+				break
+			}
+		}
+	}
+
+	var ready []*entry
+	for _, e := range candidates {
 		if e.inFlight < p.cfg.MaxInFlight {
 			ready = append(ready, e)
 		}
 	}
 	if len(ready) == 0 {
-		return nil, anyEligible
+		return nil, true
 	}
+	return p.claimLocked(p.chooseLocked(ready), now), true
+}
 
+// chooseLocked applies the configured strategy to a non-empty ready set.
+func (p *Pool) chooseLocked(ready []*entry) *entry {
 	var chosen *entry
 	switch p.cfg.Strategy {
 	case StrategySequential:
@@ -731,7 +857,7 @@ func (p *Pool) pickLocked(now time.Time, preferredUID string, exclude map[string
 			}
 		}
 	}
-	return p.claimLocked(chosen, now), true
+	return chosen
 }
 
 func (p *Pool) claimLocked(e *entry, now time.Time) *auth.Account {
@@ -873,6 +999,9 @@ func (e poolError) Error() string { return string(e) }
 const (
 	ErrNoHealthyAccounts = poolError("no healthy Amazon Quick accounts available")
 	ErrPoolBusy          = poolError("all healthy Amazon Quick accounts are currently at max concurrency")
+	// ErrNoAdvancedAccounts is returned by AcquireWith(RequireAdvanced) when no eligible
+	// account has advanced models enabled.
+	ErrNoAdvancedAccounts = poolError("no healthy Amazon Quick accounts with advanced models enabled")
 )
 
 var _ = log.Printf

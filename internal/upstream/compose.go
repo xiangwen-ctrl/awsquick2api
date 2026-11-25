@@ -2,12 +2,26 @@ package upstream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"awsquick2api/internal/auth"
 	"awsquick2api/internal/config"
 )
+
+// maxContextAttachmentBytes caps the Stage-3 overflow context file uploaded as an
+// attachment. Larger histories are rejected with ErrKindTooLarge instead of being
+// shipped as an unbounded upload (variable so tests can lower it).
+var maxContextAttachmentBytes = 4 << 20
+
+// strictDLPEnabled reports whether strict privacy DLP applies to this request (default on).
+func (p *preparedTurn) strictDLPEnabled() bool {
+	if p.req.StrictPrivacyDLP != nil {
+		return *p.req.StrictPrivacyDLP
+	}
+	return true
+}
 
 // ChatRequest is the normalized OpenAI-style chat request passed into upstream.Client.
 type ChatRequest struct {
@@ -226,6 +240,45 @@ func (c *Client) composeTurn(
 		return maxFrameBytes <= 0 || size() <= maxFrameBytes
 	}
 
+	strictDLP := pt.strictDLPEnabled()
+	attach := func(name, mimeType string, data []byte, strictDLP bool) error {
+		att, err := c.UploadAttachment(ctx, acct, threadID, name, mimeType, data, strictDLP)
+		if err != nil {
+			return err
+		}
+		input.Attachments = append(input.Attachments, att)
+		return nil
+	}
+
+	// Upload inline base64 images before frame sizing so input.Attachments metadata is
+	// accurately included in Stage 1..4 size() checks. Any failure is surfaced: the caller
+	// must never get an answer computed without an image it sent.
+	for _, img := range images {
+		if err := attach(img.Name, img.MimeType, img.Bytes, true); err != nil {
+			if ctx.Err() != nil {
+				return composedTurn{}, ctx.Err()
+			}
+			var ue *UpstreamError
+			if errors.As(err, &ue) {
+				if ue.Kind == ErrKindBlocked {
+					return composedTurn{}, ue
+				}
+				return composedTurn{}, (&UpstreamError{
+					Kind:       ue.Kind,
+					StatusCode: ue.StatusCode,
+					Code:       ue.Code,
+					RetryAfter: ue.RetryAfter,
+					Message:    fmt.Sprintf("图片附件 %s 上传失败，未发送该请求: %s", img.Name, ue.Message),
+				}).Normalize()
+			}
+			return composedTurn{}, (&UpstreamError{
+				Kind:       ErrKindUpstream,
+				StatusCode: 502,
+				Message:    fmt.Sprintf("图片附件 %s 上传失败，未发送该请求: %v", img.Name, err),
+			}).Normalize()
+		}
+	}
+
 	askedDigest := Digest(pt.fullCustom)
 	if thread != nil && thread.Custom == askedDigest {
 		input.SystemPrompt = ""
@@ -242,6 +295,9 @@ func (c *Client) composeTurn(
 		}
 		bare := size()
 		room := maxFrameBytes / 2
+		if !shortPrompt && bare < maxFrameBytes {
+			room = max(room, bare+(maxFrameBytes-bare)/2)
+		}
 		if shortPrompt {
 			room = maxFrameBytes
 		}
@@ -264,15 +320,11 @@ func (c *Client) composeTurn(
 		}
 		input.Prompt = savedPrompt
 	}
-
-	var attachments []Attachment
-	attach := func(name, mimeType string, data []byte, strictDLP bool) error {
-		att, err := c.UploadAttachment(ctx, acct, threadID, name, mimeType, data, strictDLP)
-		if err != nil {
-			return err
-		}
-		attachments = append(attachments, att)
-		return nil
+	// The thread may already hold exactly this (compacted) custom prompt; resending it is
+	// redundant. Digests always describe what was actually sent, never the uncut text.
+	if instructed && thread != nil && thread.Custom != "" && Digest(input.SystemPrompt) == thread.Custom {
+		input.SystemPrompt = ""
+		instructed = false
 	}
 
 	// Stage 3: Offload oversized conversation history into an uploaded context file attachment.
@@ -286,7 +338,15 @@ func (c *Client) composeTurn(
 		longText := strings.Join(longBlocks, "\n\n")
 		name := "context_" + auth.NewUUID()[:8] + ".txt"
 		data := []byte(longText)
-		if aerr := attach(name, "text/plain", data, false); aerr == nil {
+		if len(data) > maxContextAttachmentBytes {
+			return composedTurn{}, (&UpstreamError{
+				Kind:       ErrKindTooLarge,
+				StatusCode: 400,
+				Message:    fmt.Sprintf("溢出的对话上下文为 %d 字节，超过附件卸载上限 %d 字节", len(data), maxContextAttachmentBytes),
+			}).Normalize()
+		}
+		// The offloaded context is subject to the same DLP policy as everything else.
+		if aerr := attach(name, "text/plain", data, strictDLP); aerr == nil {
 			input.Prompt = fmt.Sprintf(
 				"Additional conversation context (%d bytes) has been attached as %s. Read the attached file first, then respond to the conversation.",
 				len(data), name,
@@ -297,10 +357,19 @@ func (c *Client) composeTurn(
 			blocks = []string{input.Prompt}
 		} else if ctx.Err() != nil {
 			return composedTurn{}, ctx.Err()
+		} else {
+			var ue *UpstreamError
+			if errors.As(aerr, &ue) && (ue.Kind == ErrKindBlocked || (strictDLP && ue.Code == dlpInconclusiveCode)) {
+				// A DLP block (or, in strict mode, no DLP verdict / scan failure / 401-403)
+				// must not be bypassed by falling back to sending the same content inline.
+				return composedTurn{}, ue
+			}
+			// Other upload failures fall back to Stage-4 inline truncation.
 		}
 	}
 
-	// Stage 4: Fallback block compaction / truncation when attachments are disabled or unavailable.
+	// Stage 4: Fallback block compaction / truncation when attachments are disabled,
+	// unavailable, or Stage-3 notice + attachment metadata still exceed the frame limit.
 	if !fits() {
 		syncPrompt := func() bool {
 			input.Prompt = strings.Join(blocks, "\n\n")
@@ -321,21 +390,6 @@ func (c *Client) composeTurn(
 		syncPrompt()
 	}
 
-	// Upload inline base64 images via official upload + DLP + thread delivery flow.
-	for _, img := range images {
-		if err := attach(img.Name, img.MimeType, img.Bytes, true); err != nil {
-			if ctx.Err() != nil {
-				return composedTurn{}, ctx.Err()
-			}
-			// Surface DLP policy blocks explicitly instead of silently ignoring images.
-			if ue, ok := err.(*UpstreamError); ok && ue.Kind == ErrKindBlocked {
-				return composedTurn{}, ue
-			}
-		}
-	}
-	if len(attachments) > 0 {
-		input.Attachments = attachments
-	}
 	if !fits() {
 		return composedTurn{}, &UpstreamError{
 			Kind:       ErrKindTooLarge,
@@ -344,9 +398,12 @@ func (c *Client) composeTurn(
 		}
 	}
 
+	// Record the digest of the custom prompt that was actually sent (possibly compacted),
+	// so a later turn re-sends the full instructions once they fit instead of assuming the
+	// thread already holds them.
 	customDigest := ""
 	if instructed {
-		customDigest = askedDigest
+		customDigest = Digest(input.SystemPrompt)
 	} else if thread != nil {
 		customDigest = thread.Custom
 	}

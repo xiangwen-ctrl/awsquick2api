@@ -8,17 +8,24 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"awsquick2api/internal/auth"
 	"awsquick2api/internal/pool"
+	"awsquick2api/internal/reqlog"
 )
 
 const (
 	batchConcurrency  = 4
 	perAccountTimeout = 25 * time.Second
+	// unknownExpiryRefreshInterval rate-limits proactive refreshes of accounts whose
+	// access-token expiry is unknown (ExpiresAt <= 0). Such accounts are refreshed on
+	// the first check, then at most once per interval, so a refresh that still yields
+	// no expiry cannot hammer the token endpoint.
+	unknownExpiryRefreshInterval = 15 * time.Minute
 )
 
 // UpstreamClient is the minimal interface Scheduler requires from internal/upstream.
@@ -46,6 +53,8 @@ type Scheduler struct {
 	retryMu  sync.Mutex
 	retryAt  map[string]time.Time
 	failures map[string]int
+	// unknownExpAt records the last successful proactive refresh for accounts that still have ExpiresAt <= 0.
+	unknownExpAt map[string]time.Time
 }
 
 func New(cfg Config) *Scheduler {
@@ -59,9 +68,10 @@ func New(cfg Config) *Scheduler {
 		cfg.TokenRefreshAdvance = 10 * time.Minute
 	}
 	return &Scheduler{
-		cfg:      cfg,
-		retryAt:  map[string]time.Time{},
-		failures: map[string]int{},
+		cfg:          cfg,
+		retryAt:      map[string]time.Time{},
+		failures:     map[string]int{},
+		unknownExpAt: map[string]time.Time{},
 	}
 }
 
@@ -129,7 +139,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 				lastQuota = now
 				s.RefreshAllQuotas(ctx)
 			}
-			_ = cfg.Pool.Flush()
+			if cfg.Pool != nil {
+				_ = cfg.Pool.Flush()
+			}
 		}
 	}
 }
@@ -158,7 +170,7 @@ func (s *Scheduler) RefreshOneTokenIfStale(ctx context.Context, uid, staleAccess
 		if staleAccessToken != "" && acct.AccessToken != staleAccessToken {
 			return nil
 		}
-		if acct.RefreshToken == "" || acct.RefreshToken == "none" {
+		if !hasRefreshToken(acct) {
 			return fmt.Errorf("account %q has no refresh_token", uid)
 		}
 
@@ -166,9 +178,12 @@ func (s *Scheduler) RefreshOneTokenIfStale(ctx context.Context, uid, staleAccess
 		if err != nil {
 			var se *auth.StepError
 			if errors.As(err, &se) && se.Expired {
-				p.Disable(uid, "token_expired: "+se.Message)
+				p.Disable(uid, "token_expired: "+reqlog.ScrubCredentials(se.Message))
 			}
 			return err
+		}
+		if updated == nil {
+			return fmt.Errorf("account %q: refresh returned no account", uid)
 		}
 
 		saved := p.UpdateAccount(updated)
@@ -177,13 +192,18 @@ func (s *Scheduler) RefreshOneTokenIfStale(ctx context.Context, uid, staleAccess
 		}
 		if authDir != "" && vault != nil {
 			if serr := auth.SaveAccount(authDir, vault, saved); serr != nil {
-				log.Printf("WARN: [scheduler] save refreshed account %s: %v", uid, serr)
+				log.Printf("WARN: [scheduler] save refreshed account %s: %s", uid, reqlog.ScrubCredentials(serr.Error()))
 			}
 		}
 
 		s.retryMu.Lock()
 		delete(s.retryAt, uid)
 		delete(s.failures, uid)
+		if saved.ExpiresAt > 0 {
+			delete(s.unknownExpAt, uid)
+		} else {
+			s.unknownExpAt[uid] = time.Now()
+		}
 		s.retryMu.Unlock()
 
 		log.Printf("[scheduler] refreshed token acct=%s provider=%s next_exp=%s",
@@ -197,22 +217,11 @@ func (s *Scheduler) RefreshExpiringTokens(ctx context.Context) {
 	p := s.cfg.Pool
 	adv := s.cfg.TokenRefreshAdvance
 	s.mu.RUnlock()
-
-	now := time.Now()
-	accts := p.AllAccounts(false)
-	var due []*auth.Account
-	for _, a := range accts {
-		if !a.NeedsRefresh(now, adv) {
-			continue
-		}
-		s.retryMu.Lock()
-		nextTry := s.retryAt[a.UID]
-		s.retryMu.Unlock()
-		if !nextTry.IsZero() && now.Before(nextTry) {
-			continue
-		}
-		due = append(due, a)
+	if p == nil {
+		return
 	}
+
+	due := s.dueForRefresh(p.AllAccounts(false), time.Now(), adv)
 	if len(due) == 0 {
 		return
 	}
@@ -220,10 +229,9 @@ func (s *Scheduler) RefreshExpiringTokens(ctx context.Context) {
 	sem := make(chan struct{}, batchConcurrency)
 	var wg sync.WaitGroup
 	for _, a := range due {
-		if ctx.Err() != nil {
+		if !acquireSlot(ctx, sem) {
 			break
 		}
-		sem <- struct{}{}
 		wg.Add(1)
 		go func(acct *auth.Account) {
 			defer wg.Done()
@@ -236,12 +244,52 @@ func (s *Scheduler) RefreshExpiringTokens(ctx context.Context) {
 				fails := s.failures[acct.UID]
 				delay := time.Duration(min(300, 30*(1<<min(fails-1, 4)))) * time.Second
 				s.retryAt[acct.UID] = time.Now().Add(delay)
+				delete(s.unknownExpAt, acct.UID)
 				s.retryMu.Unlock()
-				log.Printf("WARN: [scheduler] proactive refresh %s failed (retry in %s): %v", acct.UID, delay, err)
+				log.Printf("WARN: [scheduler] proactive refresh %s failed (retry in %s): %s",
+					acct.UID, delay, reqlog.ScrubCredentials(err.Error()))
 			}
 		}(a)
 	}
 	wg.Wait()
+}
+
+// dueForRefresh selects accounts needing a proactive refresh: tokens expiring within
+// adv, plus refreshable accounts with unknown expiry (ExpiresAt <= 0), the latter
+// rate-limited by unknownExpiryRefreshInterval. Accounts in failure backoff are skipped.
+func (s *Scheduler) dueForRefresh(accts []*auth.Account, now time.Time, adv time.Duration) []*auth.Account {
+	s.retryMu.Lock()
+	defer s.retryMu.Unlock()
+	present := make(map[string]bool, len(accts))
+	var due []*auth.Account
+	for _, a := range accts {
+		if a == nil {
+			continue
+		}
+		present[a.UID] = true
+		if next := s.retryAt[a.UID]; !next.IsZero() && now.Before(next) {
+			continue
+		}
+		switch {
+		case a.NeedsRefresh(now, adv):
+		case a.ExpiresAt <= 0 && hasRefreshToken(a):
+			if last := s.unknownExpAt[a.UID]; !last.IsZero() && now.Sub(last) < unknownExpiryRefreshInterval {
+				continue
+			}
+			// The window is recorded only after a successful refresh still leaves
+			// ExpiresAt <= 0 (see RefreshOneTokenIfStale), so cancelled batches or
+			// transient failures fall back to normal backoff instead of waiting 15m.
+		default:
+			continue
+		}
+		due = append(due, a)
+	}
+	for uid := range s.unknownExpAt {
+		if !present[uid] {
+			delete(s.unknownExpAt, uid)
+		}
+	}
+	return due
 }
 
 func (s *Scheduler) RefreshOneQuota(ctx context.Context, uid string) (pool.QuotaInfo, error) {
@@ -249,6 +297,9 @@ func (s *Scheduler) RefreshOneQuota(ctx context.Context, uid string) (pool.Quota
 	p := s.cfg.Pool
 	up := s.cfg.Upstream
 	s.mu.RUnlock()
+	if p == nil || up == nil {
+		return pool.QuotaInfo{}, fmt.Errorf("scheduler not initialized")
+	}
 
 	acct := p.AuthByUID(uid)
 	if acct == nil {
@@ -262,24 +313,35 @@ func (s *Scheduler) RefreshOneQuota(ctx context.Context, uid string) (pool.Quota
 	}
 	q, err := up.GetQuota(ctx, acct)
 	if err != nil {
-		q.Known = false
-		q.UpdatedAt = time.Now().UnixMilli()
-		q.UnavailableReason = err.Error()
-		p.UpdateQuota(uid, q)
-		return q, err
+		// Transient failure: keep the cached quota instead of zeroing it and only
+		// record the (credential-scrubbed) reason.
+		p.MarkQuotaError(uid, err.Error())
+		cached, _ := p.QuotaOf(uid)
+		return cached, err
 	}
+	q.UnavailableReason = reqlog.ScrubCredentials(q.UnavailableReason)
 	if adv, aerr := up.CheckAdvanced(ctx, acct); aerr == nil {
 		q.AdvancedEnabled = adv
+		q.AdvancedKnown = true
 	}
+	// On CheckAdvanced failure q.AdvancedKnown stays as GetQuota reported it, so the
+	// pool keeps its last authoritative AdvancedEnabled value.
 	p.UpdateQuota(uid, q)
 	_ = p.Flush()
-	return q, nil
+	stored, ok := p.QuotaOf(uid)
+	if !ok {
+		stored = q
+	}
+	return stored, nil
 }
 
 func (s *Scheduler) RefreshAllQuotas(ctx context.Context) int {
 	s.mu.RLock()
 	p := s.cfg.Pool
 	s.mu.RUnlock()
+	if p == nil {
+		return 0
+	}
 
 	accts := p.AllAccounts(false)
 	if len(accts) == 0 {
@@ -289,10 +351,9 @@ func (s *Scheduler) RefreshAllQuotas(ctx context.Context) int {
 	var wg sync.WaitGroup
 	var okCount atomic.Int64
 	for _, a := range accts {
-		if ctx.Err() != nil {
+		if !acquireSlot(ctx, sem) {
 			break
 		}
-		sem <- struct{}{}
 		wg.Add(1)
 		go func(uid string) {
 			defer wg.Done()
@@ -300,7 +361,7 @@ func (s *Scheduler) RefreshAllQuotas(ctx context.Context) int {
 			actx, cancel := context.WithTimeout(ctx, perAccountTimeout)
 			defer cancel()
 			if _, err := s.RefreshOneQuota(actx, uid); err != nil {
-				log.Printf("WARN: [scheduler] quota refresh %s: %v", uid, err)
+				log.Printf("WARN: [scheduler] quota refresh %s: %s", uid, reqlog.ScrubCredentials(err.Error()))
 			} else {
 				okCount.Add(1)
 			}
@@ -309,4 +370,22 @@ func (s *Scheduler) RefreshAllQuotas(ctx context.Context) int {
 	wg.Wait()
 	_ = p.Flush()
 	return int(okCount.Load())
+}
+
+// acquireSlot takes a semaphore slot, returning false as soon as ctx is done
+// (including when ctx is already cancelled while slots are still free).
+func acquireSlot(ctx context.Context, sem chan struct{}) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	select {
+	case sem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func hasRefreshToken(a *auth.Account) bool {
+	return a != nil && strings.TrimSpace(a.RefreshToken) != "" && a.RefreshToken != "none"
 }

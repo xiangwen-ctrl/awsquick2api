@@ -9,4 +9,14 @@
 
 ## Reporting a Vulnerability
 
-If you find a security issue, please report it privately via [GitHub Security Advisories](https://github.com/xiangwen-ctrl/awsquick2api/security/advisories/new) instead of opening a public issue.
+Please do **not** disclose vulnerability details (exploit steps, tokens, account data, logs) in a public issue.
+
+1. **Preferred — private report**: use [GitHub Security Advisories](https://github.com/xiangwen-ctrl/awsquick2api/security/advisories/new) ("Report a vulnerability") if it is enabled for this repository.
+2. **If private reporting is unavailable**: open a public [GitHub Issue](https://github.com/xiangwen-ctrl/awsquick2api/issues/new) titled `Security contact request` containing **no technical details**, and ask the repository owner for a private channel. The owner will reply with a way to share the details privately (for example, by enabling a private advisory for you).
+3. Non-sensitive hardening suggestions (documentation, defaults, defense-in-depth ideas without a working exploit) may be filed as regular issues.
+
+When reporting, include the affected version (`/healthz` or the startup log line `AWSQuick2API vX.Y.Z`), platform, and a minimal reproduction. Redact all `api_key` / `admin_key` values (`qk_...` / `qka_...`), OAuth tokens, account emails and proxy credentials.
+
+## Supported Versions
+
+Security fixes are released for the latest published release only.

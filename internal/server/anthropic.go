@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"awsquick2api/internal/auth"
+	"awsquick2api/internal/reqlog"
 	"awsquick2api/internal/upstream"
 )
 
@@ -26,6 +27,10 @@ func (h *Handler) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Requ
 	var req map[string]any
 	if err := json.Unmarshal(raw, &req); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Invalid JSON: "+err.Error())
+		return
+	}
+	if msgs, ok := req["messages"].([]any); !ok || len(msgs) == 0 {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "messages: field required and must be a non-empty array")
 		return
 	}
 	runes, images := estimateAnthropicPayload(req)
@@ -137,16 +142,15 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 
 	flusher, _ := w.(http.Flusher)
 	var (
-		writeMu      sync.Mutex
-		started      bool
-		blockIdx     int
-		openBlock    string // "" | "thinking" | "text"
-		stopPingCh   = make(chan struct{})
-		stopPingOnce sync.Once
+		writeMu   sync.Mutex
+		started   bool
+		blockIdx  int
+		openBlock string // "" | "thinking" | "text"
+		pinger    *sseKeepalive
 	)
-	stopPing := func() {
-		stopPingOnce.Do(func() { close(stopPingCh) })
-	}
+	// stopPing blocks until the ping goroutine has exited, so no "ping" event can be
+	// written after message_stop or after ServeHTTP returns (e.g. on 499).
+	stopPing := func() { pinger.Stop() }
 	defer stopPing()
 
 	writeEvent := func(eventName string, payload any) {
@@ -207,20 +211,9 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 			},
 		})
 
-		go func() {
-			tk := time.NewTicker(anthropicPingInterval)
-			defer tk.Stop()
-			for {
-				select {
-				case <-stopPingCh:
-					return
-				case <-r.Context().Done():
-					return
-				case <-tk.C:
-					writeEvent("ping", map[string]any{"type": "ping"})
-				}
-			}
-		}()
+		pinger = startSSEKeepalive(r.Context(), anthropicPingInterval, func() {
+			writeEvent("ping", map[string]any{"type": "ping"})
+		})
 	}
 
 	onEvent := func(ev upstream.ChatEvent) {
@@ -288,7 +281,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 			"type": "error",
 			"error": map[string]any{
 				"type":    "api_error",
-				"message": ue.Error(),
+				"message": reqlog.ScrubCredentials(ue.Error()),
 			},
 		})
 		return
@@ -313,7 +306,8 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 				},
 			})
 			args := strings.TrimSpace(tc.Arguments)
-			if args == "" {
+			var objCheck map[string]any
+			if args == "" || json.Unmarshal([]byte(args), &objCheck) != nil || objCheck == nil {
 				args = "{}"
 			}
 			writeEvent("content_block_delta", map[string]any{
@@ -363,7 +357,7 @@ func writeAnthropicNonStream(w http.ResponseWriter, msgID, model string, res ups
 	if len(res.ToolCalls) > 0 {
 		stopReason = "tool_use"
 		for _, tc := range res.ToolCalls {
-			var inputObj any = map[string]any{}
+			var inputObj map[string]any
 			if err := json.Unmarshal([]byte(tc.Arguments), &inputObj); err != nil || inputObj == nil {
 				inputObj = map[string]any{}
 			}
@@ -501,11 +495,15 @@ func anthropicToChatRequest(body map[string]any, headers http.Header) (upstream.
 						flushUser()
 						tcID, _ := bm["tool_use_id"].(string)
 						resContent := convertAnthropicToolResultContent(bm["content"])
-						msgs = append(msgs, map[string]any{
+						toolMsg := map[string]any{
 							"role":         "tool",
 							"tool_call_id": tcID,
 							"content":      resContent,
-						})
+						}
+						if isErr, _ := bm["is_error"].(bool); isErr {
+							toolMsg["is_error"] = true
+						}
+						msgs = append(msgs, toolMsg)
 					case "text":
 						if t, ok := bm["text"].(string); ok {
 							userParts = append(userParts, map[string]any{"type": "text", "text": t})
@@ -529,7 +527,12 @@ func anthropicToChatRequest(body map[string]any, headers http.Header) (upstream.
 			if !ok {
 				continue
 			}
-			// Skip Anthropic server-side built-in tool types without input_schema if custom_name absent.
+			// Skip Anthropic server-side built-in tools (web_search_*, web_fetch_*,
+			// code_execution_*, ...): they are typed, carry no input_schema, and are
+			// executed by Anthropic itself, so they must not be bridged as client tools.
+			if typ, _ := tm["type"].(string); typ != "" && typ != "custom" && tm["input_schema"] == nil {
+				continue
+			}
 			name, _ := tm["name"].(string)
 			if strings.TrimSpace(name) == "" {
 				continue

@@ -11,9 +11,9 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
-
-	"awsquick2api/internal/safefile"
+	"time"
 )
 
 const localVaultFormat = "awsquick2api-local-aes256gcm-v1"
@@ -60,10 +60,98 @@ func OpenOrCreateVault(keyPath, envKey string) (*Vault, error) {
 		return nil, fmt.Errorf("generate encryption key: %w", rerr)
 	}
 	encoded := base64.StdEncoding.EncodeToString(key) + "\n"
-	if werr := safefile.WriteAtomic(keyPath, []byte(encoded), 0o600); werr != nil {
+	created, werr := createKeyFileExclusive(keyPath, []byte(encoded))
+	if werr != nil {
 		return nil, fmt.Errorf("write encryption key %s: %w", keyPath, werr)
 	}
+	if !created {
+		// Another process or goroutine created the key first: use it, never overwrite it.
+		return readVaultKeyFile(keyPath)
+	}
 	return &Vault{key: key}, nil
+}
+
+func readVaultKeyFile(keyPath string) (*Vault, error) {
+	var lastErr error
+	const attempts = 50
+	for attempt := 0; attempt < attempts; attempt++ {
+		data, err := os.ReadFile(keyPath)
+		switch {
+		case err != nil:
+			lastErr = err
+		case attempt < attempts-5 && !strings.HasSuffix(string(data), "\n"):
+			lastErr = errors.New("key file write in progress")
+		case strings.TrimSpace(string(data)) == "":
+			lastErr = errors.New("key file is empty")
+		default:
+			k, derr := decodeOrDeriveKey(strings.TrimSpace(string(data)))
+			if derr == nil {
+				return &Vault{key: k}, nil
+			}
+			lastErr = derr
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if lastErr == nil {
+		lastErr = errors.New("key file is empty")
+	}
+	return nil, fmt.Errorf("read encryption key %s: %w", keyPath, lastErr)
+}
+
+// createKeyFileExclusive writes data to path only if path does not exist yet. The content is
+// staged in a private temp file and published with a hard link, which fails instead of
+// replacing an existing key, so concurrent first starts cannot end up with different keys.
+// It reports whether this call created the file.
+func createKeyFileExclusive(path string, data []byte) (bool, error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return false, err
+	}
+	tmp, err := os.CreateTemp(dir, ".key-*")
+	if err != nil {
+		return false, err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return false, err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return false, err
+	}
+	if err := tmp.Close(); err != nil {
+		return false, err
+	}
+	_ = os.Chmod(tmpName, 0o600)
+
+	lerr := os.Link(tmpName, path)
+	if lerr == nil {
+		return true, nil
+	}
+	if errors.Is(lerr, fs.ErrExist) {
+		return false, nil
+	}
+	// Filesystems without hard links: fall back to exclusive creation.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, fs.ErrExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return false, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return false, err
+	}
+	return true, f.Close()
 }
 
 // NewVaultFromKey constructs an in-memory Vault from a 32-byte key (useful for tests).

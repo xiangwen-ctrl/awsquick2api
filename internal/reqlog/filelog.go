@@ -22,7 +22,7 @@ func NewRotatingFileWriter(path string, maxBytes int64) (*RotatingFileWriter, er
 	if maxBytes <= 0 {
 		maxBytes = defaultLogRotateBytes
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
@@ -72,7 +72,7 @@ func (w *RotatingFileWriter) Write(p []byte) (int, error) {
 }
 
 func (w *RotatingFileWriter) openLocked() error {
-	_ = os.MkdirAll(filepath.Dir(w.path), 0o755)
+	_ = os.MkdirAll(filepath.Dir(w.path), 0o700)
 	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err

@@ -1,3 +1,17 @@
+# AWSQuick2API systemd unit.
+#
+# Runs as a dedicated unprivileged user. Create it and hand over the install
+# directory once before enabling the service:
+#
+#   sudo useradd --system --home-dir /opt/awsquick2api --shell /usr/sbin/nologin awsquick2api
+#   sudo install -d -o awsquick2api -g awsquick2api -m 0700 /opt/awsquick2api
+#   sudo install -o awsquick2api -g awsquick2api -m 0755 awsquick2api-linux-amd64 /opt/awsquick2api/awsquick2api
+#   sudo chown -R awsquick2api:awsquick2api /opt/awsquick2api   # config.json, auths/, data/
+#   sudo cp awsquick2api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now awsquick2api
+#
+# UMask=0077 keeps config.json, auths/, data/ and logs readable by this user only.
+
 [Unit]
 Description=AWSQuick2API Multi-Account Amazon Quick Gateway
 After=network-online.target
@@ -5,15 +19,23 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=awsquick2api
+Group=awsquick2api
+UMask=0077
 WorkingDirectory=/opt/awsquick2api
 ExecStart=/opt/awsquick2api/awsquick2api -no-tray -config /opt/awsquick2api/config.json
 Restart=on-failure
 RestartSec=5s
+# Must exceed server.shutdown_timeout_seconds (default 30) so in-flight streams can drain.
+TimeoutStopSec=45s
 Environment=AWSQUICK_NO_TRAY=1
 Environment=GOMEMLIMIT=180MiB
 MemoryMax=256M
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/awsquick2api
 
 [Install]
 WantedBy=multi-user.target

@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"awsquick2api/internal/reqlog"
 	"awsquick2api/internal/safefile"
 )
 
@@ -23,6 +24,15 @@ type persistedPoolState struct {
 	Entries   map[string]persistedEntry `json:"entries"`
 }
 
+// scrubPersisted redacts credentials from free-text fields before they are written to
+// (or restored from) state.json.
+func scrubPersisted(pe persistedEntry) persistedEntry {
+	pe.DisabledReason = reqlog.ScrubCredentials(pe.DisabledReason)
+	pe.CooldownReason = reqlog.ScrubCredentials(pe.CooldownReason)
+	pe.Quota.UnavailableReason = reqlog.ScrubCredentials(pe.Quota.UnavailableReason)
+	return pe
+}
+
 func (p *Pool) restoreState() {
 	if p.cfg.StateFile == "" {
 		return
@@ -37,6 +47,7 @@ func (p *Pool) restoreState() {
 	}
 	now := time.Now()
 	for uid, pe := range st.Entries {
+		pe = scrubPersisted(pe)
 		e := &entry{
 			disabled:       pe.Disabled,
 			disabledReason: pe.DisabledReason,
@@ -93,6 +104,9 @@ func (p *Pool) Flush() error {
 	}
 	p.mu.Unlock()
 
+	for uid, pe := range st.Entries {
+		st.Entries[uid] = scrubPersisted(pe)
+	}
 	raw, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err

@@ -93,6 +93,13 @@ func buildTransport(rawProxy string) (*http.Transport, dialContextFunc, error) {
 			}()
 			select {
 			case <-ctx.Done():
+				// The dial keeps running in the background; close whatever it
+				// eventually returns so the SOCKS5 connection is not leaked.
+				go func() {
+					if r := <-ch; r.c != nil {
+						_ = r.c.Close()
+					}
+				}()
 				return nil, ctx.Err()
 			case r := <-ch:
 				return r.c, r.err
@@ -178,9 +185,28 @@ func makeHTTPConnectDialer(proxyURL *url.URL, base *net.Dialer) dialContextFunc 
 			_ = conn.Close()
 			return nil, fmt.Errorf("proxy CONNECT returned HTTP %d", resp.StatusCode)
 		}
+		// The proxy may already have sent tunnel bytes (e.g. the TLS ServerHello)
+		// in the same read as the CONNECT response; don't drop them.
+		if br.Buffered() > 0 {
+			return &bufferedConn{Conn: conn, r: br}, nil
+		}
 		return conn, nil
 	}
 }
+
+// bufferedConn replays bytes already read into r before reading from Conn.
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+// errTransport fails every request; used instead of silently going direct
+// when upstream.proxy_url is invalid.
+type errTransport struct{ err error }
+
+func (t errTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, t.err }
 
 func (c *Client) transportAndDialer() (*http.Transport, dialContextFunc, error) {
 	proxyURL := strings.TrimSpace(c.Config().ProxyURL)
@@ -205,11 +231,14 @@ func (c *Client) transportAndDialer() (*http.Transport, dialContextFunc, error) 
 }
 
 // HTTPClient returns an *http.Client configured with the single optional upstream.proxy_url.
-// Falls back to a direct client if the configured proxy URL is invalid.
+// An invalid proxy URL fails closed: requests error out instead of bypassing the proxy.
 func (c *Client) HTTPClient(timeout time.Duration) *http.Client {
 	tr, _, err := c.transportAndDialer()
 	if err != nil {
-		return &http.Client{Timeout: timeout}
+		return &http.Client{
+			Transport: errTransport{err: fmt.Errorf("invalid upstream.proxy_url: %w", err)},
+			Timeout:   timeout,
+		}
 	}
 	return &http.Client{
 		Transport: tr,

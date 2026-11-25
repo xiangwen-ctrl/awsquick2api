@@ -33,27 +33,38 @@ import (
 	"awsquick2api/internal/upstream"
 )
 
-var appVersion = "0.1.1"
+var appVersion = "0.1.2"
+
+func formatStartupErrorDialog(err error, logFileHint string) string {
+	msg := fmt.Sprintf("启动失败：%s", reqlog.ScrubCredentials(err.Error()))
+	if logFileHint != "" {
+		msg += fmt.Sprintf("\n\n详细日志：%s", logFileHint)
+	}
+	return msg
+}
 
 func main() {
 	var (
 		showGUIError bool
 		logFileHint  string
+		closeLog     func()
 	)
-	if err := run(&showGUIError, &logFileHint); err != nil {
-		log.Printf("FATAL: %v", err)
+	err := run(&showGUIError, &logFileHint, &closeLog)
+	if err != nil {
+		log.Printf("FATAL: %s", reqlog.ScrubCredentials(err.Error()))
+	}
+	if closeLog != nil {
+		closeLog()
+	}
+	if err != nil {
 		if showGUIError {
-			msg := fmt.Sprintf("启动失败：%v", err)
-			if logFileHint != "" {
-				msg += fmt.Sprintf("\n\n详细日志：%s", logFileHint)
-			}
-			tray.ShowErrorDialog("AWSQuick2API 启动失败", msg)
+			tray.ShowErrorDialog("AWSQuick2API 启动失败", formatStartupErrorDialog(err, logFileHint))
 		}
 		os.Exit(1)
 	}
 }
 
-func run(showGUIError *bool, logFileHint *string) error {
+func run(showGUIError *bool, logFileHint *string, closeLog *func()) error {
 	cfgFlag := flag.String("config", "", "Path to config.json (defaults to config.json in current dir or next to executable)")
 	noTrayFlag := flag.Bool("no-tray", false, "Disable Windows system tray icon and GUI dialogs (headless / CLI mode)")
 	openFlag := flag.Bool("open", false, "Open the Web panel in default browser once listening")
@@ -142,7 +153,11 @@ func run(showGUIError *bool, logFileHint *string) error {
 		log.Printf("WARN: [log] failed to open rotating log %s: %v", logFilePath, flErr)
 	} else {
 		log.SetOutput(&bestEffortLogWriter{writers: []io.Writer{fileLog, rec, os.Stderr}})
-		defer func() { _ = fileLog.Close() }()
+		if closeLog != nil {
+			*closeLog = sync.OnceFunc(func() { _ = fileLog.Close() })
+		} else {
+			defer func() { _ = fileLog.Close() }()
+		}
 	}
 	if created {
 		log.Printf("[config] %s not found; generated default config with independent api_key and admin_key (read them from %s)", absCfgPath, absCfgPath)
@@ -214,13 +229,18 @@ func run(showGUIError *bool, logFileHint *string) error {
 			return nil
 		},
 	)
-	defer cbMgr.Close()
+	// The OAuth callback servers are closed explicitly during shutdown, after
+	// in-flight requests have drained; the deferred call covers early returns.
+	closeCallbacks := sync.OnceFunc(cbMgr.Close)
+	defer closeCallbacks()
 
 	live := config.NewLiveHolder(cfg)
 	var cfgMu sync.Mutex
+	bootCfg := *cfg
 	currentCfg := cfg
 
-	pn := panel.New(panel.Config{
+	var pn *panel.Panel
+	pn = panel.New(panel.Config{
 		Pool:         p,
 		Vault:        vault,
 		Upstream:     up,
@@ -234,6 +254,20 @@ func run(showGUIError *bool, logFileHint *string) error {
 		ModelsPath:   modelsPath,
 		Version:      appVersion,
 		EnvOverrides: config.ActiveEnvOverrides,
+		// Effective listen address (after AWSQUICK_LISTEN) for the panel's Host-header guard.
+		ListenAddr:   cfg.Listen,
+		TrustedHosts: cfg.Server.TrustedHosts,
+		// Imported accounts get their quota / AdvancedEnabled synced right away instead
+		// of waiting for the next scheduled refresh. Panel already calls this in its own goroutine.
+		OnAccountsImported: func(uids []string) {
+			for _, uid := range uids {
+				qctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				if _, err := sch.RefreshOneQuota(qctx, uid); err != nil {
+					log.Printf("WARN: [panel] quota sync after import uid=%s: %v", uid, err)
+				}
+				cancel()
+			}
+		},
 		LoadConfig: func() (*config.Config, error) {
 			cfgMu.Lock()
 			defer cfgMu.Unlock()
@@ -242,12 +276,14 @@ func run(showGUIError *bool, logFileHint *string) error {
 		SaveConfig: func(raw []byte) (panel.SaveConfigResult, error) {
 			cfgMu.Lock()
 			defer cfgMu.Unlock()
-			next, restartFields, err := config.SaveFull(absCfgPath, raw, currentCfg)
+			next, _, err := config.SaveFull(absCfgPath, raw, currentCfg)
 			if err != nil {
 				return panel.SaveConfigResult{}, err
 			}
+			restartFields := config.DiffRestartFields(&bootCfg, next)
 			currentCfg = next
 			live.UpdateFrom(next)
+			pn.UpdateTrustedHosts(next.Server.TrustedHosts)
 			p.UpdateConfig(pool.Config{
 				MaxInFlight:     next.Pool.MaxInFlight,
 				SoftCooldown:    time.Duration(next.Pool.SoftCooldownSec) * time.Second,
@@ -303,11 +339,15 @@ func run(showGUIError *bool, logFileHint *string) error {
 		return fmt.Errorf("http listen %s: %w", cfg.Listen, err)
 	}
 
+	// The scheduler has its own context so token refresh keeps serving in-flight
+	// requests until the HTTP server has drained during shutdown.
+	schCtx, cancelSch := context.WithCancel(context.Background())
+	defer cancelSch()
 	var bgWG sync.WaitGroup
 	bgWG.Add(1)
 	go func() {
 		defer bgWG.Done()
-		sch.Run(ctx)
+		sch.Run(schCtx)
 	}()
 
 	srv := &http.Server{
@@ -366,16 +406,32 @@ func run(showGUIError *bool, logFileHint *string) error {
 	log.Printf("Endpoints : /v1/chat/completions | /v1/messages | /v1/responses | /v1/models")
 	log.Printf("================================================================")
 
+	// finishShutdown runs once the HTTP server has drained (or been force-closed):
+	// OAuth callback servers -> scheduler -> pool state flush. rec.Close() runs last.
+	finishShutdown := func() {
+		closeCallbacks()
+		cancelSch()
+		bgWG.Wait()
+		if ferr := p.Flush(); ferr != nil {
+			log.Printf("WARN: pool flush on shutdown: %v", ferr)
+		}
+	}
+
+	shutdownTimeout := time.Duration(cfg.Server.ShutdownTimeoutSeconds) * time.Second
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
 		<-ctx.Done()
-		graceTimer := time.AfterFunc(2*time.Second, cancelReqs)
-		defer graceTimer.Stop()
-		sctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Server.ShutdownTimeoutSeconds)*time.Second)
+		// Restore default signal handling so a second Ctrl+C / SIGTERM force-exits.
+		stop()
+		log.Printf("[shutdown] no longer accepting connections; waiting up to %s for in-flight requests", shutdownTimeout)
+		sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
+		// Shutdown closes the listener first, then waits for active requests
+		// (including long SSE streams). Request contexts are cancelled only when
+		// that exceeds shutdown_timeout_seconds.
 		if err := srv.Shutdown(sctx); err != nil {
-			log.Printf("WARN: graceful shutdown timeout: %v", err)
+			log.Printf("WARN: graceful shutdown timed out after %s: %v; cancelling in-flight requests", shutdownTimeout, err)
 			cancelReqs()
 			_ = srv.Close()
 		}
@@ -383,24 +439,18 @@ func run(showGUIError *bool, logFileHint *string) error {
 
 	listenErr := srv.Serve(ln)
 	if listenErr != nil && !errors.Is(listenErr, http.ErrServerClosed) {
-		cancelApp()
-		stop()
 		cancelReqs()
-		bgWG.Wait()
-		_ = p.Flush()
+		cancelApp()
+		<-shutdownDone
+		finishShutdown()
 		rec.Close()
 		return fmt.Errorf("http serve: %w", listenErr)
 	}
 
+	// Serve returns ErrServerClosed as soon as Shutdown starts; wait for the drain.
 	<-shutdownDone
-	cancelApp()
-	stop()
 	cancelReqs()
-	bgWG.Wait()
-
-	if ferr := p.Flush(); ferr != nil {
-		log.Printf("WARN: pool flush on shutdown: %v", ferr)
-	}
+	finishShutdown()
 	log.Printf("awsquick2api exited cleanly")
 	rec.Close()
 	return nil
@@ -470,27 +520,61 @@ func runImportEncrypted(absCfgPath, cfgDir, inPath string, overwrite bool) error
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(cfg.AuthDir, 0o700); err != nil {
+	imported, skipped, err := importEncryptedAccounts(cfg.AuthDir, vault, accts, overwrite)
+	if err != nil {
 		return err
 	}
-	existing, _ := auth.LoadDir(cfg.AuthDir, vault)
+	fmt.Printf("Imported %d account(s) into %s (skipped %d existing)\n", imported, cfg.AuthDir, skipped)
+	return nil
+}
+
+func importEncryptedAccounts(authDir string, vault *auth.Vault, accts []*auth.Account, overwrite bool) (int, int, error) {
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		return 0, 0, err
+	}
+	// Validate every account before persisting any so a tampered bundle fails cleanly.
+	for _, a := range accts {
+		if a == nil || (strings.TrimSpace(a.AccessToken) == "" && strings.TrimSpace(a.RefreshToken) == "") {
+			return 0, 0, fmt.Errorf("imported account missing tokens")
+		}
+		if verr := auth.ValidateImportedAccountEndpoints(a); verr != nil {
+			label := a.UID
+			if !auth.ValidUID(label) {
+				label = "(invalid uid)"
+			}
+			return 0, 0, fmt.Errorf("imported account %s failed endpoint validation: %w", label, verr)
+		}
+	}
+	existing, _ := auth.LoadDir(authDir, vault)
 	hasUID := map[string]bool{}
 	for _, a := range existing {
 		hasUID[a.UID] = true
 	}
 	imported, skipped := 0, 0
 	for _, a := range accts {
+		a.Provider = auth.NormalizeProvider(a.Provider)
+		a.Stage = auth.NormalizeStage(a.Stage)
+		if !auth.ValidUID(a.UID) {
+			ident := a.Email
+			if ident == "" {
+				ident = a.AccountID
+			}
+			a.UID = auth.MakeUID(a.Provider, ident)
+		}
+		if !auth.IsDeviceID(a.DeviceID) {
+			a.DeviceID = auth.NewUUID()
+		}
 		if !overwrite && hasUID[a.UID] {
 			skipped++
 			continue
 		}
-		if err := auth.SaveAccount(cfg.AuthDir, vault, a); err != nil {
-			return err
+		if err := auth.SaveAccount(authDir, vault, a); err != nil {
+			return imported, skipped, err
 		}
+		hasUID[a.UID] = true
 		imported++
 	}
-	fmt.Printf("Imported %d account(s) into %s (skipped %d existing)\n", imported, cfg.AuthDir, skipped)
-	return nil
+	return imported, skipped, nil
 }
 
 func readLineStdin() (string, error) {
@@ -525,15 +609,10 @@ func resolveConfigPath(flagPath, exePath string) string {
 }
 
 func anchorRelativePaths(cfg *config.Config, baseDir string) {
-	if cfg == nil || baseDir == "" {
+	if cfg == nil {
 		return
 	}
-	if cfg.AuthDir != "" && !filepath.IsAbs(cfg.AuthDir) {
-		cfg.AuthDir = filepath.Join(baseDir, cfg.AuthDir)
-	}
-	if cfg.DataDir != "" && !filepath.IsAbs(cfg.DataDir) {
-		cfg.DataDir = filepath.Join(baseDir, cfg.DataDir)
-	}
+	cfg.AnchorPaths(baseDir)
 }
 
 func isEnvTruthy(key string) bool {

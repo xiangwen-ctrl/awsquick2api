@@ -3,6 +3,7 @@ package upstream
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"sync"
@@ -56,7 +57,21 @@ func MessageKey(m map[string]any) string {
 	}
 	tcID, _ := m["tool_call_id"].(string)
 	name, _ := m["name"].(string)
-	return role + ":" + Digest(tcID+"\n"+name+"\n"+ContentText(m["content"], nil, nil))
+	body := ContentText(m["content"], nil, nil)
+	// ContentText drops image parts, so two turns that differ only by their
+	// attached image would collide. Fold the raw structured content in too.
+	if content, ok := m["content"]; ok && content != nil {
+		if _, isStr := content.(string); !isStr {
+			if raw, err := json.Marshal(content); err == nil {
+				body += "\n" + string(raw)
+			}
+		}
+	}
+	flags := ""
+	if isErr, _ := m["is_error"].(bool); isErr {
+		flags = "\nis_error"
+	}
+	return role + ":" + Digest(tcID+"\n"+name+flags+"\n"+body)
 }
 
 // ThreadEntry tracks one active Amazon Quick server-side thread and its committed history keys.
@@ -97,6 +112,7 @@ func (s *ThreadStore) Match(account, session string, keys []string) *ThreadEntry
 	for id, t := range s.threads {
 		if now.Sub(t.At) > threadTTL {
 			delete(s.threads, id)
+			s.removeOrderLocked(id)
 			continue
 		}
 		if t.Busy || t.Account != account || t.Session != session {

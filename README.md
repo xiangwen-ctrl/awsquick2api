@@ -94,20 +94,67 @@ wire_api = "responses"
 | `amazon-balanced` | `balanced` | `balanced`, `qw-balanced`, `aws-quick/balanced` |
 | `amazon-fast` | `fast` | `fast`, `qw-fast`, `aws-quick/fast` |
 | `amazon-auto` | `auto` | `auto`, `qw-auto`, `aws-quick/auto` |
-| `amazon-advanced` | `advanced` | `advanced`, `qw-advanced`（账号开通后可见） |
+| `amazon-advanced` | `advanced` | `advanced`, `qw-advanced`, `aws-quick/advanced`（仅当池中至少有一个账号开通 Advanced 时出现在 `/v1/models`） |
+
+> `aws-quick/<档位>` 与 `qw/<档位>` 形式的 provider 前缀会被自动剥离，例如 `aws-quick/advanced-high` 等价于 `amazon-advanced-high`。`amazon-advanced` 只会调度到已开通 Advanced 的账号；池中没有此类账号时请求返回 `400`。
 
 ## 配置说明
 
-完整配置项参考 [`config.example.json`](./config.example.json)，面板保存后大部分配置即时生效。Linux 服务器 `systemd` 部署及无头登录见 [`docs/LINUX.md`](./docs/LINUX.md)。
+完整配置项参考 [`config.example.json`](./config.example.json)，面板保存后大部分配置即时生效；`listen`、`auth_dir`、`data_dir` 与 `server.read_timeout_seconds` / `shutdown_timeout_seconds` / `max_payload_bytes` 修改后需重启（面板会提示 `restart_required`），`server.trusted_hosts` 支持热生效。若 `admin_key` 为空，首次启动会生成一次并写回 `config.json`，之后重启保持不变。Linux 服务器 `systemd` 部署及无头登录见 [`docs/LINUX.md`](./docs/LINUX.md)。
+
+常用配置项补充：
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `features.strict_privacy_dlp` | `true` | 严格隐私脱敏：在流式回复与工具调用参数中屏蔽账号邮箱、姓名、ID 及其编码 / 拆字 / 倒序变体（如 `[at]`/`(at)` 混淆邮箱），防止共享 `api_key` 时泄露账号身份。可在面板「模型与接入」页切换；关闭后仅保留基础脱敏。 |
+| `upstream.max_frame_bytes` | `63000` | 单帧上限（字节），用于消息压缩拟合与超限重试。`0` 或负数会被纠正为默认值，最小 `8192`。 |
+| `server.shutdown_timeout_seconds` | `30` | 优雅退出时等待进行中请求（含流式对话）结束的最长时间，超时后才强制中断。 |
+| `server.trusted_hosts` | `[]` | 本机回环监听并配合 Nginx/Caddy TLS 反代访问面板时，额外放行的 `Host` 域名白名单（防 DNS 重绑定；支持热生效）。 |
+
+### 命令行参数
+
+| 参数 | 说明 |
+| --- | --- |
+| `-config <path>` | 指定 `config.json` 路径（默认当前目录或可执行文件同目录）；`auth_dir` / `data_dir` 的相对路径以该文件所在目录为基准 |
+| `-no-tray` | 禁用 Windows 系统托盘与图形对话框（无头 / 服务模式），等同 `AWSQUICK_NO_TRAY=1` |
+| `-open` | 启动后在默认浏览器打开管理面板 |
+| `-export-encrypted <file>` | 将 `auth_dir` 中全部账号导出为口令加密文件后退出 |
+| `-import-encrypted <file>` | 从口令加密文件导入账号后退出 |
+| `-overwrite` | 与 `-import-encrypted` 配合，覆盖已存在的同名账号 |
+
+### 环境变量
+
+环境变量优先于 `config.json`，面板会提示哪些配置被环境变量覆盖。
 
 | 环境变量 | 说明 |
 | --- | --- |
 | `AWSQUICK_LISTEN` | 监听地址（默认 `127.0.0.1:8045`） |
+| `AWSQUICK_TRUSTED_HOSTS` | 逗号分隔的额外允许访问面板的 `Host` 域名白名单（对应 `server.trusted_hosts`，适用于环回监听 + TLS 反代） |
 | `AWSQUICK_API_KEY` | 覆盖推理密钥 |
-| `AWSQUICK_ADMIN_KEY` | 覆盖管理面板密钥 |
-| `AWSQUICK_PROXY_URL` | 可选出站代理（`http://`、`https://`、`socks5://`、`socks5h://`） |
+| `AWSQUICK_ADMIN_KEY` | 覆盖管理面板密钥（不会写入 `config.json`） |
+| `AWSQUICK_AUTH_DIR` | 覆盖账号凭据目录 `auth_dir` |
+| `AWSQUICK_DATA_DIR` | 覆盖数据目录 `data_dir`（状态、日志、`encryption.key`） |
+| `AWSQUICK_PROXY_URL` | 可选出站代理（`http://`、`https://`、`socks5://`、`socks5h://`）；日志中的代理账号密码会被脱敏 |
 | `AWSQUICK_ENCRYPTION_KEY` | 自定义本地凭据加密密钥 |
 | `AWSQUICK_CALLBACK_PORT` | 本地 OAuth 回调端口（默认 `18080`） |
+| `AWSQUICK_NO_TRAY` | 设为 `1` / `true` 时等同 `-no-tray` |
+| `AWSQUICK_STAGE` | 上游环境（`prod` / `beta` / `integ` / `dev`，默认 `prod`） |
+| `AWSQUICK_DEFAULT_REGION` | 默认区域（默认 `us-east-1`） |
+| `AWSQUICK_APP_VERSION` | 覆盖上报的客户端版本号 |
+| `AWSQUICK_OIDC_BASE` / `AWSQUICK_DISCOVERY_URL` / `AWSQUICK_DATA_PLANE_URL` | 高级：覆盖 OIDC、服务发现与数据面端点（一般无需设置） |
+
+### Linux systemd 部署
+
+[`deploy/linux/awsquick2api.service`](./deploy/linux/awsquick2api.service) 以专用非特权用户运行并设置 `UMask=0077`。启用前先创建用户并授予安装目录：
+
+```bash
+sudo useradd --system --home-dir /opt/awsquick2api --shell /usr/sbin/nologin awsquick2api
+sudo install -d -o awsquick2api -g awsquick2api -m 0700 /opt/awsquick2api
+sudo install -o awsquick2api -g awsquick2api -m 0755 awsquick2api-linux-amd64 /opt/awsquick2api/awsquick2api
+sudo chown -R awsquick2api:awsquick2api /opt/awsquick2api
+sudo cp deploy/linux/awsquick2api.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now awsquick2api
+```
 
 跨机迁移账号可在面板导出 / 导入，或使用命令行（迁移前请先停止源端进程）：
 
@@ -121,11 +168,14 @@ wire_api = "responses"
 需要 Go 1.26+：
 
 ```bash
-# Linux / macOS
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o awsquick2api ./cmd/awsquick2api
+# Linux / macOS（-X 注入版本号，显示在启动日志与面板中）
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.appVersion=$(git describe --tags --always)" -o awsquick2api ./cmd/awsquick2api
+
+# Linux amd64 + arm64 交叉编译（自动注入 git describe 版本）
+./scripts/build-linux.sh        # 或 Windows 上：./scripts/build-linux.ps1
 
 # Windows（系统托盘版）
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H=windowsgui" -o awsquick2api.exe ./cmd/awsquick2api
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H=windowsgui -X main.appVersion=0.1.2" -o awsquick2api.exe ./cmd/awsquick2api
 
 # 运行测试
 CGO_ENABLED=0 go test ./...

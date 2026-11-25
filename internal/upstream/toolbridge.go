@@ -1,11 +1,26 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"html"
 	"sort"
 	"strings"
 )
+
+func marshalJSONNoEscape(v any, indent bool) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if indent {
+		enc.SetIndent("", "  ")
+	}
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+}
 
 const (
 	ToolOpen  = "<client_tool_call>"
@@ -141,7 +156,7 @@ func BuildResponseFormatPrompt(rf ResponseFormat) string {
 	case "json_schema":
 		schemaStr := "{}"
 		if rf.Schema != nil {
-			if b, err := json.Marshal(rf.Schema); err == nil {
+			if b, err := marshalJSONNoEscape(rf.Schema, false); err == nil {
 				schemaStr = string(b)
 			}
 		}
@@ -159,7 +174,7 @@ func shortSchemaType(schema any, depth int) string {
 	if en, ok := m["enum"].([]any); ok && len(en) > 0 && len(en) <= 8 {
 		parts := make([]string, 0, len(en))
 		for _, v := range en {
-			b, _ := json.Marshal(v)
+			b, _ := marshalJSONNoEscape(v, false)
 			parts = append(parts, string(b))
 		}
 		return strings.Join(parts, "|")
@@ -290,7 +305,7 @@ func formatToolListing(defs []ToolDef, detail string) string {
 		}
 		return header + strings.Join(lines, "\n")
 	default:
-		b, _ := json.MarshalIndent(defs, "", "  ")
+		b, _ := marshalJSONNoEscape(defs, true)
 		return string(b)
 	}
 }
@@ -310,7 +325,7 @@ func BuildToolBridgePrompt(defs []ToolDef, choice ToolChoice, parallel bool, det
 		"Wait for the caller to return each tool result before continuing.",
 	}
 	if choice.Mode == "function" && choice.Name != "" {
-		b, _ := json.Marshal(choice.Name)
+		b, _ := marshalJSONNoEscape(choice.Name, false)
 		lines = append(lines, fmt.Sprintf("Required tool: %s.", string(b)))
 	}
 	if choice.Mode == "required" {
@@ -330,7 +345,14 @@ func parseToolEnvelopes(payload string) []map[string]any {
 	}
 	var val any
 	if err := json.Unmarshal([]byte(s), &val); err != nil {
-		return nil
+		// Some model outputs XML/HTML-escape the payload (&quot; &lt; &amp; &#39; ...).
+		// Only when the raw text is not valid JSON, unescape the entities and try once more.
+		if !strings.Contains(s, "&") {
+			return nil
+		}
+		if err := json.Unmarshal([]byte(html.UnescapeString(s)), &val); err != nil {
+			return nil
+		}
 	}
 	switch x := val.(type) {
 	case []any:
@@ -375,41 +397,23 @@ func toolCallsFromEnvelopes(envs []map[string]any, allowed map[string]bool) []To
 }
 
 // ExtractMarkedToolCalls strips valid <client_tool_call>...</client_tool_call> blocks and returns cleaned text + calls.
+//
+// The scan is JSON-aware: a literal closing tag inside a JSON string never ends a call early.
+// A stray opening tag that is not followed by a tool JSON payload is kept as text and skipped,
+// so it cannot swallow a later real call. Markers inside Markdown code fences (``` or ~~~,
+// including an unclosed fence) are examples and are never executed.
 func ExtractMarkedToolCalls(text string, allowed map[string]bool) (string, []ToolCall) {
 	if len(allowed) == 0 {
 		return text, nil
 	}
-	var (
-		clean   strings.Builder
-		replies []ToolCall
-		rest    = text
-	)
-	for {
-		start := strings.Index(rest, ToolOpen)
-		if start < 0 {
-			break
-		}
-		end := strings.Index(rest[start+len(ToolOpen):], ToolClose)
-		if end < 0 {
-			break
-		}
-		end += start + len(ToolOpen)
-		clean.WriteString(rest[:start])
-		inner := rest[start+len(ToolOpen) : end]
-		parsed := toolCallsFromEnvelopes(parseToolEnvelopes(inner), allowed)
-		if len(parsed) > 0 {
-			replies = append(replies, parsed...)
-		} else {
-			// Unknown or malformed marker: keep original text untouched.
-			clean.WriteString(rest[start : end+len(ToolClose)])
-		}
-		rest = rest[end+len(ToolClose):]
-	}
-	if len(replies) == 0 {
+	var clean strings.Builder
+	sc := newMarkerScanner(allowed, func(s string) { clean.WriteString(s) })
+	sc.push(text)
+	sc.finish()
+	if len(sc.calls) == 0 {
 		return text, nil
 	}
-	clean.WriteString(rest)
-	return strings.TrimSpace(clean.String()), replies
+	return strings.TrimSpace(clean.String()), sc.calls
 }
 
 // ExtractBareToolCalls handles a model that answered with bare JSON (optionally fenced) instead of markers.
@@ -420,6 +424,10 @@ func ExtractBareToolCalls(text string, allowed map[string]bool) (string, []ToolC
 	trimmed := strings.TrimSpace(text)
 	if strings.HasPrefix(trimmed, "```") {
 		if nl := strings.IndexByte(trimmed, '\n'); nl >= 0 {
+			lang := strings.ToLower(strings.TrimSpace(trimmed[3:nl]))
+			if lang != "" && lang != "json" {
+				return text, nil
+			}
 			trimmed = strings.TrimSpace(trimmed[nl+1:])
 			if strings.HasSuffix(trimmed, "```") {
 				trimmed = strings.TrimSpace(trimmed[:len(trimmed)-3])
@@ -445,22 +453,393 @@ func ParseClientToolCalls(text string, allowed map[string]bool) (string, []ToolC
 	return ExtractBareToolCalls(text, allowed)
 }
 
+type markerStatus int
+
+const (
+	markerMore markerStatus = iota // undecidable until more input arrives
+	markerCall                     // valid call(s); consume through the closing tag
+	markerText                     // well-formed block without a usable call; keep it verbatim
+	markerSkip                     // not a tool payload; keep only the opening tag as text
+)
+
+type jsonScanState int
+
+const (
+	jsonIncomplete jsonScanState = iota
+	jsonComplete
+	jsonInvalid
+)
+
+// jsonStructScan incrementally finds the end of a JSON object/array, honoring strings and
+// escapes so brackets or tags inside string values are ignored. It only tracks structure;
+// full validation is left to encoding/json.
+type jsonStructScan struct {
+	pos   int
+	stack []byte
+	inStr bool
+	esc   bool
+	state jsonScanState
+	end   int
+}
+
+func (j *jsonStructScan) scan(s string) (int, jsonScanState) {
+	if j.state != jsonIncomplete {
+		return j.end, j.state
+	}
+	for ; j.pos < len(s); j.pos++ {
+		c := s[j.pos]
+		if j.inStr {
+			if c < 0x20 {
+				// RFC 8259 forbids unescaped control characters (including raw newlines) inside strings.
+				j.state, j.end = jsonInvalid, j.pos
+				return j.end, j.state
+			}
+			switch {
+			case j.esc:
+				j.esc = false
+			case c == '\\':
+				j.esc = true
+			case c == '"':
+				j.inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			j.inStr = true
+		case '{':
+			j.stack = append(j.stack, '}')
+		case '[':
+			j.stack = append(j.stack, ']')
+		case '}', ']':
+			n := len(j.stack)
+			if n == 0 || j.stack[n-1] != c {
+				j.state, j.end = jsonInvalid, j.pos
+				return j.end, j.state
+			}
+			j.stack = j.stack[:n-1]
+			if n == 1 {
+				j.state, j.end = jsonComplete, j.pos+1
+				return j.end, j.state
+			}
+		}
+	}
+	return len(s), jsonIncomplete
+}
+
+func matchEntityQuotePrefix(after string) probeDecision {
+	low := strings.ToLower(after)
+	for _, q := range []string{"&quot;", "&#34;", "&#x22;"} {
+		if strings.HasPrefix(low, q) {
+			return probeHold
+		}
+		if strings.HasPrefix(q, low) {
+			return probeMore
+		}
+	}
+	return probeRelease
+}
+
+// classifyMarkedJSONLead checks whether a payload starting with '{' or '[' after <client_tool_call>
+// begins like a JSON object (or array of objects), allowing any first key name and tolerating
+// XML entity quotes (&quot; / &#34; / &#x22;). Non-JSON prose like "{...}" is rejected immediately.
+func classifyMarkedJSONLead(body string) (entity bool, dec probeDecision) {
+	if body == "" {
+		return false, probeMore
+	}
+	s := body
+	if s[0] == '[' {
+		after := strings.TrimLeft(s[1:], " \t\r\n")
+		if after == "" {
+			return false, probeMore
+		}
+		if after[0] != '{' {
+			return false, probeRelease
+		}
+		s = after
+	}
+	if s[0] != '{' {
+		return false, probeRelease
+	}
+	after := strings.TrimLeft(s[1:], " \t\r\n")
+	if after == "" {
+		return false, probeMore
+	}
+	if after[0] == '"' {
+		return false, probeHold
+	}
+	if after[0] == '&' {
+		d := matchEntityQuotePrefix(after)
+		return d == probeHold, d
+	}
+	return false, probeRelease
+}
+
+func partialSuffixLen(s, tag string) int {
+	limit := len(tag) - 1
+	if len(s) < limit {
+		limit = len(s)
+	}
+	for n := limit; n > 0; n-- {
+		if strings.HasPrefix(tag, s[len(s)-n:]) {
+			return n
+		}
+	}
+	return 0
+}
+
+// markerScanner is the single incremental parser behind both ExtractMarkedToolCalls and
+// BridgeStream, so chunked streaming and one-shot parsing always agree.
+type markerScanner struct {
+	allowed   map[string]bool
+	onText    func(string)
+	buf       string
+	midLine   bool
+	inMarker  bool
+	fenceChar byte
+	fenceLen  int
+	js        jsonStructScan
+	calls     []ToolCall
+}
+
+func newMarkerScanner(allowed map[string]bool, onText func(string)) *markerScanner {
+	return &markerScanner{allowed: allowed, onText: onText}
+}
+
+func (s *markerScanner) text(t string) {
+	if t != "" && s.onText != nil {
+		s.onText(t)
+	}
+}
+
+func (s *markerScanner) push(delta string) {
+	if delta == "" {
+		return
+	}
+	s.buf += delta
+	s.run(false)
+}
+
+func (s *markerScanner) finish() {
+	s.run(true)
+	if s.buf != "" {
+		s.text(s.buf)
+		s.buf = ""
+	}
+}
+
+// resolve decides what the <client_tool_call> at the start of s.buf is.
+func (s *markerScanner) resolve(final bool) (markerStatus, int, []ToolCall) {
+	after := s.buf[len(ToolOpen):]
+	body := strings.TrimLeft(after, " \t\r\n")
+	if body == "" {
+		if final {
+			return markerSkip, len(ToolOpen), nil
+		}
+		return markerMore, 0, nil
+	}
+	if body[0] != '{' && body[0] != '[' {
+		return markerSkip, len(ToolOpen), nil
+	}
+	base := len(ToolOpen) + len(after) - len(body)
+	// Reject obvious non-JSON immediately (e.g. "{...}" or prose after a stray tag) while still
+	// allowing any valid JSON object key order inside an explicit <client_tool_call> tag.
+	entity, leadDec := classifyMarkedJSONLead(body)
+	switch leadDec {
+	case probeMore:
+		if !final {
+			return markerMore, 0, nil
+		}
+		return markerSkip, len(ToolOpen), nil
+	case probeRelease:
+		return markerSkip, len(ToolOpen), nil
+	}
+	if entity {
+		// Entity-escaped quotes hide string boundaries from the structural scan, so fall back
+		// to the first closing tag and let parseToolEnvelopes unescape the payload.
+		k := strings.Index(body, ToolClose)
+		if k < 0 {
+			if final {
+				return markerSkip, len(ToolOpen), nil
+			}
+			return markerMore, 0, nil
+		}
+		if calls := toolCallsFromEnvelopes(parseToolEnvelopes(body[:k]), s.allowed); len(calls) > 0 {
+			return markerCall, base + k + len(ToolClose), calls
+		}
+		return markerSkip, len(ToolOpen), nil
+	}
+	end, st := s.js.scan(body)
+	switch st {
+	case jsonIncomplete:
+		if final {
+			return markerSkip, len(ToolOpen), nil
+		}
+		return markerMore, 0, nil
+	case jsonInvalid:
+		return markerSkip, len(ToolOpen), nil
+	}
+	tail := body[end:]
+	rest := strings.TrimLeft(tail, " \t\r\n")
+	if strings.HasPrefix(rest, ToolClose) {
+		consumed := base + end + len(tail) - len(rest) + len(ToolClose)
+		if calls := toolCallsFromEnvelopes(parseToolEnvelopes(body[:end]), s.allowed); len(calls) > 0 {
+			return markerCall, consumed, calls
+		}
+		if strings.Contains(body[:end], ToolOpen) {
+			// The "block" spans another opening tag: treat this one as stray text instead.
+			return markerSkip, len(ToolOpen), nil
+		}
+		return markerText, consumed, nil
+	}
+	if !final && len(rest) < len(ToolClose) && strings.HasPrefix(ToolClose, rest) {
+		return markerMore, 0, nil
+	}
+	return markerSkip, len(ToolOpen), nil
+}
+
+func (s *markerScanner) run(final bool) {
+	for s.buf != "" {
+		if s.inMarker {
+			if !s.handleMarker(final) {
+				return
+			}
+			continue
+		}
+		if !s.midLine {
+			i := 0
+			for i < len(s.buf) && (s.buf[i] == ' ' || s.buf[i] == '\t') {
+				i++
+			}
+			if i == len(s.buf) {
+				if final {
+					s.text(s.buf)
+					s.buf = ""
+				}
+				return
+			}
+			if c := s.buf[i]; c == '`' || c == '~' {
+				j := i
+				for j < len(s.buf) && s.buf[j] == c {
+					j++
+				}
+				if j == len(s.buf) && !final {
+					return
+				}
+				if run := j - i; run >= 3 {
+					nl := strings.IndexByte(s.buf[j:], '\n')
+					if nl < 0 && !final {
+						return
+					}
+					end := len(s.buf)
+					if nl >= 0 {
+						end = j + nl + 1
+					}
+					info := strings.TrimSpace(s.buf[j:end])
+					fenceLine := false
+					switch {
+					case s.fenceLen == 0:
+						// CommonMark: a backtick fence's info string cannot contain backticks.
+						if c != '`' || strings.IndexByte(info, '`') < 0 {
+							s.fenceChar, s.fenceLen = c, run
+							fenceLine = true
+						}
+					case c == s.fenceChar && run >= s.fenceLen && info == "":
+						s.fenceLen = 0
+						fenceLine = true
+					default:
+						fenceLine = true // ordinary line inside a fence
+					}
+					if fenceLine {
+						s.text(s.buf[:end])
+						s.buf = s.buf[end:]
+						continue
+					}
+				}
+			}
+			s.midLine = true
+		}
+		if s.fenceLen > 0 {
+			nl := strings.IndexByte(s.buf, '\n')
+			if nl < 0 {
+				s.text(s.buf)
+				s.buf = ""
+				return
+			}
+			s.text(s.buf[:nl+1])
+			s.buf = s.buf[nl+1:]
+			s.midLine = false
+			continue
+		}
+		nl := strings.IndexByte(s.buf, '\n')
+		line := s.buf
+		if nl >= 0 {
+			line = s.buf[:nl+1]
+		}
+		idx := strings.Index(line, ToolOpen)
+		if idx < 0 {
+			if nl >= 0 {
+				s.text(line)
+				s.buf = s.buf[nl+1:]
+				s.midLine = false
+				continue
+			}
+			keep := 0
+			if !final {
+				keep = partialSuffixLen(s.buf, ToolOpen)
+			}
+			s.text(s.buf[:len(s.buf)-keep])
+			s.buf = s.buf[len(s.buf)-keep:]
+			return
+		}
+		s.text(s.buf[:idx])
+		s.buf = s.buf[idx:]
+		s.inMarker = true
+	}
+}
+
+// handleMarker resolves the <client_tool_call> at the start of s.buf. It returns false when
+// more input is needed; the JSON scan position is kept, so a long call is scanned only once.
+func (s *markerScanner) handleMarker(final bool) bool {
+	st, n, calls := s.resolve(final)
+	switch st {
+	case markerMore:
+		return false
+	case markerCall:
+		s.calls = append(s.calls, calls...)
+		s.buf = s.buf[n:]
+	case markerText:
+		s.text(s.buf[:n])
+		s.buf = s.buf[n:]
+	default:
+		s.text(ToolOpen)
+		s.buf = s.buf[len(ToolOpen):]
+	}
+	s.inMarker = false
+	s.js = jsonStructScan{}
+	return true
+}
+
 // BridgeStream incrementally forwards assistant text deltas in real time while holding back
-// potential <client_tool_call> markers or bare-JSON responses until completion.
+// potential <client_tool_call> markers or bare-JSON responses until they can be decided.
 type BridgeStream struct {
 	allowed map[string]bool
 	onText  func(string)
-	mode    string // "start" | "text" | "held"
+	mode    string // "start" | "probe" | "text" | "held"
 	pending string
+	lead    string
 	emitted bool
+	sc      *markerScanner
 }
 
 func NewBridgeStream(allowed map[string]bool, onText func(string)) *BridgeStream {
-	return &BridgeStream{
+	b := &BridgeStream{
 		allowed: allowed,
 		onText:  onText,
 		mode:    "start",
 	}
+	b.sc = newMarkerScanner(allowed, b.emit)
+	return b
 }
 
 func (b *BridgeStream) emit(text string) {
@@ -468,12 +847,109 @@ func (b *BridgeStream) emit(text string) {
 		return
 	}
 	if !b.emitted && strings.TrimSpace(text) == "" {
-		b.pending = text + b.pending
+		b.lead += text
 		return
 	}
+	text = b.lead + text
+	b.lead = ""
 	b.emitted = true
 	if b.onText != nil {
 		b.onText(text)
+	}
+}
+
+type probeDecision int
+
+const (
+	probeMore probeDecision = iota
+	probeHold
+	probeRelease
+)
+
+func classifyJSONObjectPrefix(s string) probeDecision {
+	after := strings.TrimLeft(s[1:], " \t\r\n")
+	if after == "" {
+		return probeMore
+	}
+	if after[0] == '&' {
+		// Entity-escaped key quote, e.g. {&quot;name&quot;:...}.
+		return matchEntityQuotePrefix(after)
+	}
+	if after[0] != '"' {
+		return probeRelease
+	}
+	endQ := strings.IndexByte(after[1:], '"')
+	if endQ < 0 {
+		if len(after) > 32 {
+			return probeRelease
+		}
+		return probeMore
+	}
+	switch after[1 : 1+endQ] {
+	case "name", "arguments", "tool_calls":
+		return probeHold
+	default:
+		return probeRelease
+	}
+}
+
+func classifyBareJSONPrefix(body string) probeDecision {
+	if body == "" {
+		return probeMore
+	}
+	switch body[0] {
+	case '{':
+		return classifyJSONObjectPrefix(body)
+	case '[':
+		after := strings.TrimLeft(body[1:], " \t\r\n")
+		if after == "" {
+			return probeMore
+		}
+		if after[0] != '{' {
+			return probeRelease
+		}
+		return classifyJSONObjectPrefix(after)
+	default:
+		return probeRelease
+	}
+}
+
+// classifyLeadProbe decides early whether a response that starts with '{', '[' or '`' could be
+// a bare-JSON tool call (hold it) or is an ordinary answer (stream it right away).
+func classifyLeadProbe(lead string) probeDecision {
+	if lead == "" {
+		return probeMore
+	}
+	switch lead[0] {
+	case '{', '[':
+		return classifyBareJSONPrefix(lead)
+	case '`':
+		if len(lead) == 1 {
+			return probeMore
+		}
+		if len(lead) == 2 {
+			if lead == "``" {
+				return probeMore
+			}
+			return probeRelease
+		}
+		if !strings.HasPrefix(lead, "```") {
+			return probeRelease
+		}
+		nl := strings.IndexByte(lead, '\n')
+		if nl < 0 {
+			if len(lead) > 24 {
+				return probeRelease
+			}
+			return probeMore
+		}
+		lang := strings.ToLower(strings.TrimSpace(lead[3:nl]))
+		if lang != "" && lang != "json" {
+			return probeRelease
+		}
+		return classifyBareJSONPrefix(strings.TrimLeft(lead[nl+1:], " \t\r\n"))
+	default:
+		return probeRelease
 	}
 }
 
@@ -481,62 +957,51 @@ func (b *BridgeStream) Push(delta string) {
 	if delta == "" {
 		return
 	}
-	b.pending += delta
-	if b.mode == "held" {
-		return
-	}
-	if b.mode == "start" {
-		lead := strings.TrimLeft(b.pending, " \t\r\n")
-		if lead == "" {
-			return
-		}
-		if lead[0] == '{' || lead[0] == '[' || lead[0] == '`' {
-			b.mode = "held"
-			return
-		}
+	if len(b.allowed) == 0 {
 		b.mode = "text"
-	}
-	if idx := strings.Index(b.pending, ToolOpen); idx >= 0 {
-		before := b.pending[:idx]
-		b.pending = b.pending[idx:]
-		b.mode = "held"
-		b.emit(before)
+		b.emit(delta)
 		return
 	}
-	keep := 0
-	maxPrefix := len(ToolOpen) - 1
-	if len(b.pending) < maxPrefix {
-		maxPrefix = len(b.pending)
+	switch b.mode {
+	case "text":
+		b.sc.push(delta)
+		return
+	case "held":
+		b.pending += delta
+		return
 	}
-	for n := maxPrefix; n > 0; n-- {
-		if strings.HasPrefix(ToolOpen, b.pending[len(b.pending)-n:]) {
-			keep = n
-			break
-		}
+	b.pending += delta
+	lead := strings.TrimLeft(b.pending, " \t\r\n")
+	if lead == "" {
+		return
 	}
-	ready := b.pending[:len(b.pending)-keep]
-	b.pending = b.pending[len(b.pending)-keep:]
-	b.emit(ready)
+	switch classifyLeadProbe(lead) {
+	case probeMore:
+		b.mode = "probe"
+		return
+	case probeHold:
+		b.mode = "held"
+		return
+	}
+	b.mode = "text"
+	p := b.pending
+	b.pending = ""
+	b.sc.push(p)
 }
 
 func (b *BridgeStream) Finish() []ToolCall {
+	if b.mode == "text" {
+		b.sc.finish()
+		calls := b.sc.calls
+		b.sc.calls = nil
+		return calls
+	}
 	rest := b.pending
 	b.pending = ""
-	var (
-		text    string
-		replies []ToolCall
-	)
-	if b.emitted {
-		text, replies = ExtractMarkedToolCalls(rest, b.allowed)
-	} else {
-		text, replies = ParseClientToolCalls(rest, b.allowed)
-	}
+	text, replies := ParseClientToolCalls(rest, b.allowed)
 	if len(replies) > 0 {
 		if strings.TrimSpace(text) != "" {
-			b.emitted = true
-			if b.onText != nil {
-				b.onText(text)
-			}
+			b.emit(text)
 		}
 		return replies
 	}

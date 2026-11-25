@@ -31,7 +31,7 @@
           <span class="brand-dot" aria-hidden="true"></span>
           <span class="brand-title">AWSQuick2API</span>
         </div>
-        <span id="version-badge" class="badge">v0.1.1</span>
+        <span id="version-badge" class="badge">v0.1.2</span>
       </div>
       <nav class="nav-list" id="nav-list" role="tablist" aria-label="主导航">
         <button type="button" class="nav-item active" role="tab" aria-selected="true" data-tab="overview">总览与账号池</button>
@@ -154,6 +154,17 @@
               <tbody id="claude-aliases-tbody"></tbody>
             </table>
           </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>严格隐私脱敏（strict_privacy_dlp）</h3>
+            <button type="button" id="btn-toggle-privacy-dlp" class="switch-btn on" role="switch" aria-checked="true">
+              <span class="switch-track"><span class="switch-thumb"></span></span>
+              <span class="switch-label">已启用</span>
+            </button>
+          </div>
+          <p class="muted" style="margin:0 16px 14px;">启用后对上游回复执行多层账号隐私脱敏（防拆字/倒序/编码绕过与非授权邮箱兜底）。修改即时写入 config.json 并热加载。</p>
         </div>
 
         <div class="card">
@@ -330,7 +341,7 @@
       </div>
       <div class="form-row">
         <label class="muted" for="import-json">或直接粘贴加密迁移包 JSON</label>
-        <textarea id="import-json" rows="7" class="mono-editor" placeholder='{"format":"awsquick2api-enc-v1", ...}'></textarea>
+        <textarea id="import-json" rows="7" class="mono-editor" placeholder='{"format":"awsquick2api-encrypted-v1","kdf":{"name":"scrypt",...},"cipher":"aes-256-gcm","nonce":"...","ciphertext":"..."}'></textarea>
       </div>
       <div class="form-row">
         <label class="muted" for="import-pass">解密密码（必填）</label>

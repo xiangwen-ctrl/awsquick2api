@@ -18,6 +18,13 @@ import (
 	"awsquick2api/internal/safefile"
 )
 
+const (
+	// DefaultMaxFrameBytes keeps composed frames safely under Amazon Quick's 64 KB single-frame limit.
+	DefaultMaxFrameBytes = 63000
+	// MinMaxFrameBytes is the smallest accepted max_frame_bytes; smaller values cannot fit a prompt.
+	MinMaxFrameBytes = 8192
+)
+
 // Config is the root configuration structure for awsquick2api.
 type Config struct {
 	Listen   string         `json:"listen"`
@@ -36,9 +43,10 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	ReadTimeoutSeconds     int   `json:"read_timeout_seconds"`
-	ShutdownTimeoutSeconds int   `json:"shutdown_timeout_seconds"`
-	MaxPayloadBytes        int64 `json:"max_payload_bytes"`
+	ReadTimeoutSeconds     int      `json:"read_timeout_seconds"`
+	ShutdownTimeoutSeconds int      `json:"shutdown_timeout_seconds"`
+	MaxPayloadBytes        int64    `json:"max_payload_bytes"`
+	TrustedHosts           []string `json:"trusted_hosts,omitempty"`
 }
 
 type UpstreamConfig struct {
@@ -251,10 +259,17 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 		if strings.TrimSpace(cfg.AdminKey) == "" && path != "" && strings.TrimSpace(os.Getenv("AWSQUICK_ADMIN_KEY")) == "" {
 			if diskCfg, derr := LoadFileOnly(path); derr == nil && strings.TrimSpace(diskCfg.AdminKey) == "" {
 				diskCfg.AdminKey = GenerateAdminKey()
-				if raw, merr := json.MarshalIndent(diskCfg, "", "  "); merr == nil {
-					if werr := safefile.WriteAtomic(path, append(raw, '\n'), 0o600); werr == nil {
-						cfg.AdminKey = diskCfg.AdminKey
-					}
+				// Always use the generated key for this process so the panel is never
+				// left without an admin key; persist it so restarts keep the same key.
+				cfg.AdminKey = diskCfg.AdminKey
+				raw, merr := json.MarshalIndent(diskCfg, "", "  ")
+				if merr == nil {
+					merr = safefile.WriteAtomic(path, append(raw, '\n'), 0o600)
+				}
+				if merr != nil {
+					log.Printf("WARN: [config] generated admin_key but failed to persist it to %s: %v; the key is ephemeral until config.json is writable", path, merr)
+				} else {
+					log.Printf("[config] admin_key was empty; generated and persisted a new one in %s", path)
 				}
 			}
 		}
@@ -295,6 +310,7 @@ var envOverrideVars = []string{
 	"AWSQUICK_OIDC_BASE",
 	"AWSQUICK_PROXY_URL",
 	"AWSQUICK_STAGE",
+	"AWSQUICK_TRUSTED_HOSTS",
 }
 
 func ActiveEnvOverrides() []string {
@@ -349,6 +365,15 @@ func (c *Config) applyEnv() {
 	if v := strings.TrimSpace(os.Getenv("AWSQUICK_DATA_PLANE_URL")); v != "" {
 		c.Upstream.DataPlaneURL = strings.TrimRight(v, "/")
 	}
+	if v := strings.TrimSpace(os.Getenv("AWSQUICK_TRUSTED_HOSTS")); v != "" {
+		var hosts []string
+		for _, part := range strings.Split(v, ",") {
+			if h := strings.TrimSpace(part); h != "" {
+				hosts = append(hosts, h)
+			}
+		}
+		c.Server.TrustedHosts = hosts
+	}
 }
 
 func (c *Config) normalize() {
@@ -375,6 +400,23 @@ func (c *Config) normalize() {
 	}
 	if c.Server.MaxPayloadBytes > 512<<20 {
 		c.Server.MaxPayloadBytes = 512 << 20
+	}
+	if len(c.Server.TrustedHosts) > 0 {
+		seen := make(map[string]bool, len(c.Server.TrustedHosts))
+		cleaned := make([]string, 0, len(c.Server.TrustedHosts))
+		for _, h := range c.Server.TrustedHosts {
+			h = strings.TrimSpace(h)
+			if h == "" {
+				continue
+			}
+			low := strings.ToLower(h)
+			if seen[low] {
+				continue
+			}
+			seen[low] = true
+			cleaned = append(cleaned, h)
+		}
+		c.Server.TrustedHosts = cleaned
 	}
 
 	if strings.TrimSpace(c.Upstream.AppVersion) == "" {
@@ -423,8 +465,13 @@ func (c *Config) normalize() {
 	default:
 		c.Upstream.DefaultModel = "smart"
 	}
-	if c.Upstream.MaxFrameBytes < 0 {
-		c.Upstream.MaxFrameBytes = 63000
+	// max_frame_bytes drives frame fitting and the 70% FrameTooLarge retry; 0 or
+	// negative would silently disable both, so fall back to the safe default.
+	if c.Upstream.MaxFrameBytes <= 0 {
+		c.Upstream.MaxFrameBytes = DefaultMaxFrameBytes
+	}
+	if c.Upstream.MaxFrameBytes < MinMaxFrameBytes {
+		c.Upstream.MaxFrameBytes = MinMaxFrameBytes
 	}
 	c.Upstream.OIDCBase = strings.TrimRight(strings.TrimSpace(c.Upstream.OIDCBase), "/")
 	c.Upstream.DiscoveryURL = strings.TrimSpace(c.Upstream.DiscoveryURL)
@@ -495,6 +542,20 @@ func (c *Config) normalize() {
 	}
 }
 
+// AnchorPaths resolves relative auth_dir / data_dir against baseDir (normally the
+// directory containing config.json). Absolute paths and an empty baseDir are left as-is.
+func (c *Config) AnchorPaths(baseDir string) {
+	if c == nil || baseDir == "" {
+		return
+	}
+	if c.AuthDir != "" && !filepath.IsAbs(c.AuthDir) {
+		c.AuthDir = filepath.Join(baseDir, c.AuthDir)
+	}
+	if c.DataDir != "" && !filepath.IsAbs(c.DataDir) {
+		c.DataDir = filepath.Join(baseDir, c.DataDir)
+	}
+}
+
 func (c *Config) StateFile() string         { return filepath.Join(c.DataDir, "state.json") }
 func (c *Config) EncryptionKeyFile() string { return filepath.Join(c.DataDir, "encryption.key") }
 func (c *Config) RequestLogDir() string     { return filepath.Join(c.DataDir, "request-logs") }
@@ -511,6 +572,20 @@ func SaveFull(path string, raw []byte, oldCfg *Config) (*Config, []string, error
 		return nil, nil, fmt.Errorf("invalid json: %w", err)
 	}
 	diskCfg.normalize()
+	if strings.TrimSpace(diskCfg.AdminKey) == "" && strings.TrimSpace(os.Getenv("AWSQUICK_ADMIN_KEY")) == "" {
+		// Never persist an empty admin_key: it would be re-randomized on every
+		// restart. Keep the current key when there is one, otherwise generate once.
+		switch {
+		case oldCfg != nil && strings.TrimSpace(oldCfg.AdminKey) != "":
+			diskCfg.AdminKey = oldCfg.AdminKey
+		default:
+			if prev, perr := LoadFileOnly(path); perr == nil && strings.TrimSpace(prev.AdminKey) != "" {
+				diskCfg.AdminKey = prev.AdminKey
+			} else {
+				diskCfg.AdminKey = GenerateAdminKey()
+			}
+		}
+	}
 
 	outBytes, err := json.MarshalIndent(diskCfg, "", "  ")
 	if err != nil {
@@ -527,8 +602,33 @@ func SaveFull(path string, raw []byte, oldCfg *Config) (*Config, []string, error
 	}
 	next.applyEnv()
 	next.normalize()
+	// The running config has auth_dir / data_dir anchored to the config directory;
+	// anchor the new one the same way so unchanged relative paths do not diff.
+	if filepath.IsAbs(path) {
+		next.AnchorPaths(filepath.Dir(path))
+	}
 
 	return next, diffRestartFields(oldCfg, next), nil
+}
+
+func samePath(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if a == "" || b == "" {
+		return false
+	}
+	ca, cb := filepath.Clean(a), filepath.Clean(b)
+	if filepath.Separator == '\\' {
+		return strings.EqualFold(ca, cb)
+	}
+	return ca == cb
+}
+
+// DiffRestartFields reports configuration fields in next that differ from the
+// process boot configuration bootCfg and therefore require a restart to take effect.
+func DiffRestartFields(bootCfg, next *Config) []string {
+	return diffRestartFields(bootCfg, next)
 }
 
 func diffRestartFields(oldCfg, next *Config) []string {
@@ -539,10 +639,10 @@ func diffRestartFields(oldCfg, next *Config) []string {
 	if oldCfg.Listen != next.Listen {
 		restartFields = append(restartFields, "listen")
 	}
-	if oldCfg.AuthDir != next.AuthDir {
+	if !samePath(oldCfg.AuthDir, next.AuthDir) {
 		restartFields = append(restartFields, "auth_dir")
 	}
-	if oldCfg.DataDir != next.DataDir {
+	if !samePath(oldCfg.DataDir, next.DataDir) {
 		restartFields = append(restartFields, "data_dir")
 	}
 	if oldCfg.Server.ReadTimeoutSeconds != next.Server.ReadTimeoutSeconds {

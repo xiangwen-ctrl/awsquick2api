@@ -21,7 +21,8 @@ const (
 )
 
 var (
-	dataImageRE = regexp.MustCompile(`(?is)^data:(image/[a-z0-9.+-]+);base64,(.+)$`)
+	// Accepts optional media-type parameters before ;base64 (e.g. ;charset=utf-8;base64,).
+	dataImageRE = regexp.MustCompile(`(?is)^data:(image/[a-z0-9.+-]+)(?:;[a-z0-9_.+-]+=[^;,]*)*;base64,(.+)$`)
 	imageExts   = map[string]string{
 		"image/png":  "png",
 		"image/jpeg": "jpg",
@@ -53,11 +54,18 @@ func ArgumentString(raw any) string {
 		}
 		return s
 	}
-	b, err := json.Marshal(raw)
-	if err != nil || len(b) == 0 {
+	// Do not HTML-escape <, >, & — tool arguments are often code/XML and must round-trip verbatim.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(raw); err != nil {
 		return "{}"
 	}
-	return string(b)
+	out := strings.TrimSpace(buf.String())
+	if out == "" {
+		return "{}"
+	}
+	return out
 }
 
 func validateImageMagic(mimeType string, raw []byte) bool {
@@ -303,6 +311,9 @@ func PromptBlocks(messages, all []map[string]any, collectImages bool) ([]string,
 			if name != "" {
 				meta = append(meta, "name="+name)
 			}
+			if isErr, _ := m["is_error"].(bool); isErr {
+				meta = append(meta, "status=error")
+			}
 			body := content
 			if !hasContent {
 				body = "(empty)"
@@ -333,7 +344,8 @@ func PromptBlocks(messages, all []map[string]any, collectImages bool) ([]string,
 
 		default:
 			if hasContent {
-				lbl := strings.ToUpper(role[:1]) + role[1:]
+				runes := []rune(role)
+				lbl := string(unicode.ToUpper(runes[0])) + string(runes[1:])
 				blocks = append(blocks, lbl+": "+content)
 			}
 		}

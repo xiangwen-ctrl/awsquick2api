@@ -20,42 +20,43 @@ var (
 	modShell32  = windows.NewLazySystemDLL("shell32.dll")
 	modKernel32 = windows.NewLazySystemDLL("kernel32.dll")
 
-	procRegisterClassExW       = modUser32.NewProc("RegisterClassExW")
-	procUnregisterClassW       = modUser32.NewProc("UnregisterClassW")
-	procCreateWindowExW        = modUser32.NewProc("CreateWindowExW")
-	procDestroyWindow          = modUser32.NewProc("DestroyWindow")
-	procDefWindowProcW         = modUser32.NewProc("DefWindowProcW")
-	procGetMessageW            = modUser32.NewProc("GetMessageW")
-	procTranslateMessage       = modUser32.NewProc("TranslateMessage")
-	procDispatchMessageW       = modUser32.NewProc("DispatchMessageW")
-	procPostQuitMessage        = modUser32.NewProc("PostQuitMessage")
-	procPostMessageW           = modUser32.NewProc("PostMessageW")
-	procRegisterWindowMessageW = modUser32.NewProc("RegisterWindowMessageW")
-	procCreatePopupMenu        = modUser32.NewProc("CreatePopupMenu")
-	procAppendMenuW            = modUser32.NewProc("AppendMenuW")
-	procSetMenuDefaultItem     = modUser32.NewProc("SetMenuDefaultItem")
-	procTrackPopupMenuEx       = modUser32.NewProc("TrackPopupMenuEx")
-	procDestroyMenu            = modUser32.NewProc("DestroyMenu")
-	procSetForegroundWindow    = modUser32.NewProc("SetForegroundWindow")
-	procGetCursorPos           = modUser32.NewProc("GetCursorPos")
-	procCreateIconFromResEx    = modUser32.NewProc("CreateIconFromResourceEx")
-	procLoadIconW              = modUser32.NewProc("LoadIconW")
-	procDestroyIcon            = modUser32.NewProc("DestroyIcon")
-	procMessageBoxW            = modUser32.NewProc("MessageBoxW")
-	procOpenClipboard          = modUser32.NewProc("OpenClipboard")
-	procEmptyClipboard         = modUser32.NewProc("EmptyClipboard")
-	procSetClipboardData       = modUser32.NewProc("SetClipboardData")
-	procCloseClipboard         = modUser32.NewProc("CloseClipboard")
-	procShellNotifyIconW       = modShell32.NewProc("Shell_NotifyIconW")
-	procShellExecuteW          = modShell32.NewProc("ShellExecuteW")
-	procGetModuleHandleW       = modKernel32.NewProc("GetModuleHandleW")
-	procGlobalAlloc            = modKernel32.NewProc("GlobalAlloc")
-	procGlobalLock             = modKernel32.NewProc("GlobalLock")
-	procGlobalUnlock           = modKernel32.NewProc("GlobalUnlock")
-	procGlobalFree             = modKernel32.NewProc("GlobalFree")
-	procRtlMoveMemory          = modKernel32.NewProc("RtlMoveMemory")
-	procSetTimer               = modUser32.NewProc("SetTimer")
-	procKillTimer              = modUser32.NewProc("KillTimer")
+	procRegisterClassExW         = modUser32.NewProc("RegisterClassExW")
+	procUnregisterClassW         = modUser32.NewProc("UnregisterClassW")
+	procCreateWindowExW          = modUser32.NewProc("CreateWindowExW")
+	procDestroyWindow            = modUser32.NewProc("DestroyWindow")
+	procDefWindowProcW           = modUser32.NewProc("DefWindowProcW")
+	procGetMessageW              = modUser32.NewProc("GetMessageW")
+	procTranslateMessage         = modUser32.NewProc("TranslateMessage")
+	procDispatchMessageW         = modUser32.NewProc("DispatchMessageW")
+	procPostQuitMessage          = modUser32.NewProc("PostQuitMessage")
+	procPostMessageW             = modUser32.NewProc("PostMessageW")
+	procRegisterWindowMessageW   = modUser32.NewProc("RegisterWindowMessageW")
+	procCreatePopupMenu          = modUser32.NewProc("CreatePopupMenu")
+	procAppendMenuW              = modUser32.NewProc("AppendMenuW")
+	procSetMenuDefaultItem       = modUser32.NewProc("SetMenuDefaultItem")
+	procTrackPopupMenuEx         = modUser32.NewProc("TrackPopupMenuEx")
+	procDestroyMenu              = modUser32.NewProc("DestroyMenu")
+	procSetForegroundWindow      = modUser32.NewProc("SetForegroundWindow")
+	procGetCursorPos             = modUser32.NewProc("GetCursorPos")
+	procCreateIconFromResEx      = modUser32.NewProc("CreateIconFromResourceEx")
+	procLoadIconW                = modUser32.NewProc("LoadIconW")
+	procDestroyIcon              = modUser32.NewProc("DestroyIcon")
+	procMessageBoxW              = modUser32.NewProc("MessageBoxW")
+	procOpenClipboard            = modUser32.NewProc("OpenClipboard")
+	procEmptyClipboard           = modUser32.NewProc("EmptyClipboard")
+	procSetClipboardData         = modUser32.NewProc("SetClipboardData")
+	procCloseClipboard           = modUser32.NewProc("CloseClipboard")
+	procRegisterClipboardFormatW = modUser32.NewProc("RegisterClipboardFormatW")
+	procShellNotifyIconW         = modShell32.NewProc("Shell_NotifyIconW")
+	procShellExecuteW            = modShell32.NewProc("ShellExecuteW")
+	procGetModuleHandleW         = modKernel32.NewProc("GetModuleHandleW")
+	procGlobalAlloc              = modKernel32.NewProc("GlobalAlloc")
+	procGlobalLock               = modKernel32.NewProc("GlobalLock")
+	procGlobalUnlock             = modKernel32.NewProc("GlobalUnlock")
+	procGlobalFree               = modKernel32.NewProc("GlobalFree")
+	procRtlMoveMemory            = modKernel32.NewProc("RtlMoveMemory")
+	procSetTimer                 = modUser32.NewProc("SetTimer")
+	procKillTimer                = modUser32.NewProc("KillTimer")
 )
 
 const (
@@ -175,6 +176,7 @@ type Controller struct {
 	hIcon          windows.Handle
 	ownsIcon       bool
 	iconAdded      bool
+	destroyed      bool // set by WM_DESTROY (window thread only)
 	addRetries     int
 	hInst          windows.Handle
 	className      string
@@ -307,9 +309,17 @@ func (c *Controller) runLoop(ready chan<- error) {
 			c.showBalloon(c.cfg.StartupTitle, c.cfg.StartupBody)
 		}
 	}
+	// Teardown order (defers run LIFO): notification icon -> window -> icon
+	// handle -> hwnd registry entry -> window class. WM_DESTROY normally removes
+	// the notification icon while the window is still valid; this covers a
+	// message loop that ended without WM_DESTROY. The window must be gone before
+	// the icon handle it references is freed and before its class is unregistered.
 	defer func() {
-		_, _, _ = procKillTimer.Call(uintptr(c.hwnd), timerRetryAddID)
-		c.deleteTrayIcon()
+		if !c.destroyed {
+			_, _, _ = procKillTimer.Call(uintptr(c.hwnd), timerRetryAddID)
+			c.deleteTrayIcon()
+			_, _, _ = procDestroyWindow.Call(uintptr(c.hwnd))
+		}
 	}()
 
 	ready <- nil
@@ -460,7 +470,7 @@ func (c *Controller) handleMenuCommand(cmd uintptr) {
 			c.showBalloon("AWSQuick2API", "当前 admin_key 为空，请先在 config.json 中配置")
 			return
 		}
-		if err := CopyClipboardText(key); err == nil {
+		if err := copySecretToClipboard(key); err == nil {
 			c.showBalloon("AWSQuick2API", "已复制面板管理密钥 (admin_key) 到剪贴板")
 		}
 	case cmdCopyAPIKey:
@@ -472,7 +482,7 @@ func (c *Controller) handleMenuCommand(cmd uintptr) {
 			c.showBalloon("AWSQuick2API", "当前 api_key 为空，请先在 config.json 中配置")
 			return
 		}
-		if err := CopyClipboardText(key); err == nil {
+		if err := copySecretToClipboard(key); err == nil {
 			c.showBalloon("AWSQuick2API", "已复制推理密钥 (api_key) 到剪贴板")
 		}
 	case cmdCopyBaseURL:
@@ -560,6 +570,11 @@ func trayWndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 			}
 			return 0
 		case wmDestroy:
+			// Remove the notification icon while the window is still valid, then
+			// end the message loop.
+			_, _, _ = procKillTimer.Call(hwnd, timerRetryAddID)
+			c.deleteTrayIcon()
+			c.destroyed = true
 			_, _, _ = procPostQuitMessage.Call(0)
 			return 0
 		}
@@ -594,7 +609,23 @@ func OpenTarget(target string) error {
 	return nil
 }
 
-func CopyClipboardText(text string) error {
+// CopyClipboardText places non-sensitive text (e.g. the Base URL) on the clipboard.
+func CopyClipboardText(text string) error { return copyClipboard(text, false) }
+
+// copySecretToClipboard places a secret (api_key / admin_key) on the clipboard and
+// marks it so Windows clipboard history (Win+V), Cloud Clipboard sync and
+// clipboard monitors skip it.
+func copySecretToClipboard(text string) error { return copyClipboard(text, true) }
+
+// sensitiveClipboardFormats are the documented opt-out formats: the presence of
+// ExcludeClipboardContentFromMonitorProcessing, and a DWORD 0 for the other two.
+var sensitiveClipboardFormats = []string{
+	"ExcludeClipboardContentFromMonitorProcessing",
+	"CanIncludeInClipboardHistory",
+	"CanUploadToCloudClipboard",
+}
+
+func copyClipboard(text string, sensitive bool) error {
 	u16, err := windows.UTF16FromString(text)
 	if err != nil {
 		return err
@@ -607,22 +638,60 @@ func CopyClipboardText(text string) error {
 	}()
 
 	_, _, _ = procEmptyClipboard.Call()
-	byteLen := uintptr(len(u16) * 2)
-	hMem, _, err := procGlobalAlloc.Call(gmemMoveable, byteLen)
+	hMem, err := globalCopy(unsafe.Pointer(&u16[0]), uintptr(len(u16)*2))
+	if err != nil {
+		return err
+	}
+	if r, _, err := procSetClipboardData.Call(cfUnicodeText, hMem); r == 0 {
+		_, _, _ = procGlobalFree.Call(hMem)
+		return fmt.Errorf("SetClipboardData: %w", err)
+	}
+	if sensitive {
+		for _, name := range sensitiveClipboardFormats {
+			if err := setClipboardDWORD(name, 0); err != nil {
+				log.Printf("WARN: [tray] clipboard privacy format %s: %v", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// globalCopy copies n bytes from src into a new movable global memory block
+// suitable for SetClipboardData (which takes ownership on success).
+func globalCopy(src unsafe.Pointer, n uintptr) (uintptr, error) {
+	hMem, _, err := procGlobalAlloc.Call(gmemMoveable, n)
 	if hMem == 0 {
-		return fmt.Errorf("GlobalAlloc: %w", err)
+		return 0, fmt.Errorf("GlobalAlloc: %w", err)
 	}
 	ptr, _, err := procGlobalLock.Call(hMem)
 	if ptr == 0 {
 		_, _, _ = procGlobalFree.Call(hMem)
-		return fmt.Errorf("GlobalLock: %w", err)
+		return 0, fmt.Errorf("GlobalLock: %w", err)
 	}
-	_, _, _ = procRtlMoveMemory.Call(ptr, uintptr(unsafe.Pointer(&u16[0])), byteLen)
+	_, _, _ = procRtlMoveMemory.Call(ptr, uintptr(src), n)
 	_, _, _ = procGlobalUnlock.Call(hMem)
+	return hMem, nil
+}
 
-	if r, _, err := procSetClipboardData.Call(cfUnicodeText, hMem); r == 0 {
+// setClipboardDWORD adds a registered clipboard format carrying a DWORD value to
+// the currently open clipboard.
+func setClipboardDWORD(formatName string, value uint32) error {
+	namePtr, err := windows.UTF16PtrFromString(formatName)
+	if err != nil {
+		return err
+	}
+	fmtID, _, callErr := procRegisterClipboardFormatW.Call(uintptr(unsafe.Pointer(namePtr)))
+	if fmtID == 0 {
+		return fmt.Errorf("RegisterClipboardFormatW: %w", callErr)
+	}
+	v := value
+	hMem, err := globalCopy(unsafe.Pointer(&v), unsafe.Sizeof(v))
+	if err != nil {
+		return err
+	}
+	if r, _, callErr := procSetClipboardData.Call(fmtID, hMem); r == 0 {
 		_, _, _ = procGlobalFree.Call(hMem)
-		return fmt.Errorf("SetClipboardData: %w", err)
+		return fmt.Errorf("SetClipboardData: %w", callErr)
 	}
 	return nil
 }

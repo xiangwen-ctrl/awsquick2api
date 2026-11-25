@@ -104,14 +104,19 @@ func DefaultCatalog() *ModelCatalog {
 
 	claudeAliases := []ClaudeAlias{
 		{Name: "claude-opus-4-6", Slot: "smart"},
+		{Name: "claude-opus-4-5", Slot: "smart"},
 		{Name: "claude-opus-4-5-20251101", Slot: "smart"},
+		{Name: "claude-opus-4-1", Slot: "smart"},
 		{Name: "claude-opus-4-1-20250805", Slot: "smart"},
+		{Name: "claude-opus-4-20250514", Slot: "smart"},
 		{Name: "claude-sonnet-4-6", Slot: "balanced"},
 		{Name: "claude-sonnet-4-5", Slot: "balanced"},
 		{Name: "claude-sonnet-4-5-20250929", Slot: "balanced"},
+		{Name: "claude-sonnet-4-20250514", Slot: "balanced"},
 		{Name: "claude-3-7-sonnet-20250219", Slot: "balanced"},
 		{Name: "claude-3-5-sonnet-20241022", Slot: "balanced"},
 		{Name: "claude-haiku-4-5", Slot: "fast"},
+		{Name: "claude-haiku-4-5-20251001", Slot: "fast"},
 		{Name: "claude-3-5-haiku-20241022", Slot: "fast"},
 	}
 
@@ -274,7 +279,8 @@ func buildCatalog(specs []ModelSpec, claudeAliases []ClaudeAlias) *ModelCatalog 
 // Resolve maps a client-requested model ID to an Amazon Quick agent_mode slot, ModelSpec,
 // and optional thinking_effort extracted from a "-off"/"-low"/"-medium"/"-high" suffix.
 func (c *ModelCatalog) Resolve(requested, defaultSlot string, allowClaude bool) (slot string, spec ModelSpec, suffixEffort string, known bool) {
-	if c == nil {
+	if c == nil || len(c.Specs) == 0 {
+		// An empty catalog (e.g. a broken models.json) must not panic on Specs[0].
 		c = DefaultCatalog()
 	}
 	if defaultSlot == "" {
@@ -296,6 +302,7 @@ func (c *ModelCatalog) Resolve(requested, defaultSlot string, allowClaude bool) 
 	if strings.HasPrefix(key, "qw-") {
 		key = strings.TrimPrefix(key, "qw-")
 	}
+	key = normalizeBedrockModelID(key)
 
 	// Check for optional thinking effort suffix (-off, -low, -medium, -high).
 	baseKey := key
@@ -376,7 +383,8 @@ func (c *ModelCatalog) VisibleModels(hidden, allowed map[string]bool, allowlistO
 		if keep(s.ID) {
 			out = append(out, s)
 		}
-		if exposeEffortVariants && (s.Slot == "smart" || s.Slot == "balanced" || s.Slot == "fast") {
+		// Effort variants only make sense for slots that actually reason (fast does not).
+		if exposeEffortVariants && s.Caps.Reasoning && (s.Slot == "smart" || s.Slot == "balanced" || s.Slot == "advanced") {
 			for _, eff := range []string{"low", "medium", "high"} {
 				v := s
 				v.ID = s.ID + "-" + eff
@@ -456,11 +464,64 @@ func lookupOverride(m map[string]string, reqModel, slot string) string {
 	if len(m) == 0 {
 		return ""
 	}
-	if v := strings.TrimSpace(m[strings.ToLower(strings.TrimSpace(reqModel))]); v != "" {
+	get := func(target string) string {
+		if target == "" {
+			return ""
+		}
+		if v := strings.TrimSpace(m[target]); v != "" {
+			return v
+		}
+		for k, v := range m {
+			if strings.ToLower(strings.TrimSpace(k)) == target {
+				if tv := strings.TrimSpace(v); tv != "" {
+					return tv
+				}
+			}
+		}
+		return ""
+	}
+	model := strings.ToLower(strings.TrimSpace(reqModel))
+	if v := get(model); v != "" {
 		return v
 	}
-	if v := strings.TrimSpace(m[strings.ToLower(strings.TrimSpace(slot))]); v != "" {
-		return v
+	// Strip [1m] bracket tags, optional provider prefixes (aws-quick/, qw-) and Bedrock prefixes.
+	bare := strings.TrimSpace(bracketTagRE.ReplaceAllString(model, ""))
+	if bare != "" && bare != model {
+		if v := get(bare); v != "" {
+			return v
+		}
 	}
-	return ""
+	norm := bare
+	if idx := strings.LastIndexByte(norm, '/'); idx >= 0 {
+		norm = norm[idx+1:]
+	}
+	norm = strings.TrimPrefix(norm, "qw-")
+	norm = normalizeBedrockModelID(norm)
+	if norm != "" && norm != model && norm != bare {
+		if v := get(norm); v != "" {
+			return v
+		}
+	}
+	return get(strings.ToLower(strings.TrimSpace(slot)))
+}
+
+var (
+	bedrockRegionPrefixes = []string{"us.", "eu.", "ap.", "apac.", "jp.", "au.", "global."}
+	bedrockVersionRE      = regexp.MustCompile(`-v\d+(?::\d+)?$`)
+)
+
+// normalizeBedrockModelID maps Bedrock-style IDs such as
+// "us.anthropic.claude-sonnet-4-5-20250929-v1:0" to "claude-sonnet-4-5-20250929".
+func normalizeBedrockModelID(key string) string {
+	for _, p := range bedrockRegionPrefixes {
+		if strings.HasPrefix(key, p+"anthropic.") {
+			key = strings.TrimPrefix(key, p)
+			break
+		}
+	}
+	if !strings.HasPrefix(key, "anthropic.claude-") {
+		return key
+	}
+	key = strings.TrimPrefix(key, "anthropic.")
+	return bedrockVersionRE.ReplaceAllString(key, "")
 }

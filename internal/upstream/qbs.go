@@ -66,6 +66,15 @@ func (c *Client) tenantBase(acct *auth.Account) (string, error) {
 	return base, nil
 }
 
+// Gateway discovery cache lifetimes. A successful /v1/discovery answer is reused for
+// gwHostTTL. When discovery fails and the tenant host is used as a fallback, the entry
+// is only reused for gwHostFallbackTTL (<= 0 disables caching of fallbacks) so a
+// transient discovery outage does not pin the wrong cell host for ten minutes.
+var (
+	gwHostTTL         = 10 * time.Minute
+	gwHostFallbackTTL = 30 * time.Second
+)
+
 func (c *Client) gatewayHost(ctx context.Context, acct *auth.Account) (string, string, error) {
 	base, err := c.tenantBase(acct)
 	if err != nil {
@@ -74,7 +83,7 @@ func (c *Client) gatewayHost(ctx context.Context, acct *auth.Account) (string, s
 	c.gwHostMu.Lock()
 	cached, ok := c.gwHosts[base]
 	c.gwHostMu.Unlock()
-	if ok && time.Since(cached.at) < 10*time.Minute && cached.host != "" {
+	if ok && time.Since(cached.at) < gwHostTTL && cached.host != "" {
 		return cached.host, cached.wsPath, nil
 	}
 
@@ -83,7 +92,11 @@ func (c *Client) gatewayHost(ctx context.Context, acct *auth.Account) (string, s
 		return "", "", err
 	}
 	host := u.Host
-	wsPath := acct.WSPath
+	wsPath, perr := validateWSPath(acct.WSPath)
+	if perr != nil {
+		wsPath = ""
+	}
+	discovered := false
 
 	cl, err := c.accountHTTPClient(acct, 15*time.Second)
 	if err != nil {
@@ -105,11 +118,15 @@ func (c *Client) gatewayHost(ctx context.Context, acct *auth.Account) (string, s
 			if json.Unmarshal(raw, &disc) == nil {
 				if ch, _ := disc["cellHost"].(string); strings.TrimSpace(ch) != "" {
 					host = strings.TrimSpace(ch)
+					discovered = true
 				} else if wh, _ := disc["wsHost"].(string); strings.TrimSpace(wh) != "" {
 					host = strings.TrimSpace(wh)
+					discovered = true
 				}
-				if wp, _ := disc["wsPath"].(string); strings.HasPrefix(wp, "/") && !strings.HasPrefix(wp, "//") {
-					wsPath = wp
+				if wp, _ := disc["wsPath"].(string); wp != "" {
+					if vp, verr := validateWSPath(wp); verr == nil && vp != "" {
+						wsPath = vp
+					}
 				}
 			}
 		}
@@ -131,10 +148,140 @@ func (c *Client) gatewayHost(ctx context.Context, acct *auth.Account) (string, s
 		host = parsed.Host
 	}
 
+	at := time.Now()
+	if !discovered {
+		if gwHostFallbackTTL <= 0 {
+			return host, wsPath, nil
+		}
+		// gwHostEntry only records when it was stored; backdate the fallback entry so
+		// it expires gwHostFallbackTTL from now instead of after the full gwHostTTL.
+		if gwHostFallbackTTL < gwHostTTL {
+			at = at.Add(-(gwHostTTL - gwHostFallbackTTL))
+		}
+	}
 	c.gwHostMu.Lock()
-	c.gwHosts[base] = gwHostEntry{host: host, wsPath: wsPath, at: time.Now()}
+	if len(c.gwHosts) >= 256 {
+		now := time.Now()
+		for k, v := range c.gwHosts {
+			if now.Sub(v.at) >= gwHostTTL {
+				delete(c.gwHosts, k)
+			}
+		}
+		if len(c.gwHosts) >= 256 {
+			c.gwHosts = map[string]gwHostEntry{}
+		}
+	}
+	c.gwHosts[base] = gwHostEntry{host: host, wsPath: wsPath, at: at}
 	c.gwHostMu.Unlock()
 	return host, wsPath, nil
+}
+
+func isLoopbackWSHost(h string) bool {
+	switch strings.ToLower(strings.Trim(h, "[]")) {
+	case "127.0.0.1", "::1", "localhost":
+		return true
+	}
+	return false
+}
+
+// validateWSHost strictly validates a stored/imported ws_host. Remote hosts must use
+// wss (a bare host or https:// is upgraded to wss://), port 443 only, and a trusted AWS
+// domain suffix; loopback hosts (ws:// / wss://) are only accepted when allowCustom is
+// true (explicit custom endpoint override in dev/tests). The host must not carry userinfo,
+// a path, a query or a fragment. An empty value returns "".
+func validateWSHost(raw string, allowCustom bool) (string, error) {
+	v := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if v == "" {
+		return "", nil
+	}
+	for _, r := range v {
+		if r <= ' ' || r == 0x7f || r == '\\' {
+			return "", fmt.Errorf("ws_host 包含非法字符")
+		}
+	}
+	if strings.Contains(v, "@") {
+		return "", fmt.Errorf("ws_host 不得包含 @")
+	}
+	withScheme := v
+	if !strings.Contains(v, "://") {
+		withScheme = "wss://" + v
+	}
+	u, err := url.Parse(withScheme)
+	if err != nil || u.Host == "" || u.User != nil || u.Opaque != "" || u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return "", fmt.Errorf("ws_host 格式无效")
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if isLoopbackWSHost(u.Hostname()) {
+		if !allowCustom {
+			return "", fmt.Errorf("ws_host 不允许环回地址 (%s)", u.Hostname())
+		}
+		switch scheme {
+		case "ws", "http":
+			return "ws://" + u.Host, nil
+		case "wss", "https":
+			return "wss://" + u.Host, nil
+		}
+		return "", fmt.Errorf("ws_host 协议不受支持 (%s)", scheme)
+	}
+	if scheme != "wss" && scheme != "https" {
+		return "", fmt.Errorf("ws_host 必须使用 wss (%s)", scheme)
+	}
+	if p := u.Port(); p != "" && p != "443" {
+		return "", fmt.Errorf("ws_host 端口不受支持 (%s)", p)
+	}
+	if _, verr := auth.ValidateTrustedURL("https://"+u.Host, false); verr != nil {
+		return "", fmt.Errorf("ws_host 不是受信任的 AWS 域名 (%s)", u.Hostname())
+	}
+	return "wss://" + u.Host, nil
+}
+
+// validateWSPath strictly validates a stored/imported/discovered ws_path: it must be an
+// absolute path ("/..."), without scheme, "@", backslash, percent-escapes, query,
+// fragment, "//", "." or ".." segments, and only printable ASCII. Empty returns "".
+func validateWSPath(raw string) (string, error) {
+	p := strings.TrimSpace(raw)
+	if p == "" {
+		return "", nil
+	}
+	if !strings.HasPrefix(p, "/") || strings.Contains(p, "//") {
+		return "", fmt.Errorf("ws_path 必须以单个 / 开头")
+	}
+	if strings.Contains(p, "://") || strings.ContainsAny(p, "@\\%?#") {
+		return "", fmt.Errorf("ws_path 包含非法字符")
+	}
+	for _, r := range p {
+		if r <= ' ' || r >= 0x7f {
+			return "", fmt.Errorf("ws_path 包含非法字符")
+		}
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return "", fmt.Errorf("ws_path 不得包含 . 或 .. 段")
+		}
+	}
+	return p, nil
+}
+
+// accountWSEndpoint returns the account's ws_host / ws_path after strict validation.
+// An untrusted ws_host is an error (never downgraded to ws://); an invalid ws_path
+// falls back to "" so the caller uses the default stream path.
+func accountWSEndpoint(acct *auth.Account, allowCustom bool) (string, string, error) {
+	if acct == nil {
+		return "", "", nil
+	}
+	host, err := validateWSHost(acct.WSHost, allowCustom)
+	if err != nil {
+		return "", "", (&UpstreamError{
+			Kind:       ErrKindHandshake,
+			StatusCode: http.StatusBadGateway,
+			Message:    "账号 ws_host 未通过安全校验（" + err.Error() + "），请重新授权",
+		}).Normalize()
+	}
+	path, perr := validateWSPath(acct.WSPath)
+	if perr != nil {
+		path = ""
+	}
+	return host, path, nil
 }
 
 // UnwrapQBS unwraps Amazon Quick's double-wrapped qbs-event / invokeAgent response.
@@ -464,6 +611,15 @@ func (c *Client) CheckAdvanced(ctx context.Context, acct *auth.Account) (bool, e
 	return adv, nil
 }
 
+// DLP status polling budget for UploadAttachment (variables so tests can shorten them).
+var (
+	dlpPollAttempts = 30
+	dlpPollInterval = 600 * time.Millisecond
+)
+
+// dlpInconclusiveCode marks an UploadAttachment failure where DLP never reached a verdict.
+const dlpInconclusiveCode = "dlp_inconclusive"
+
 // UploadAttachment uploads bytes to Amazon Quick, polls DLP status until completed, and delivers
 // the attachment to threadID via qbs-event files/upload/<threadId>.
 func (c *Client) UploadAttachment(ctx context.Context, acct *auth.Account, threadID, name, mimeType string, data []byte, strictDLP bool) (Attachment, error) {
@@ -521,8 +677,11 @@ func (c *Client) UploadAttachment(ctx context.Context, acct *auth.Account, threa
 		return Attachment{}, &UpstreamError{Kind: ErrKindUpstream, StatusCode: 502, Message: "Amazon Quick 未返回 attachmentId"}
 	}
 
-	// Step 2: Poll DLP scan status.
-	for i := 0; i < 30; i++ {
+	// Step 2: Poll DLP scan status. Fail closed: without a COMPLETED/SKIPPED/NOT_APPLICABLE
+	// verdict inside the polling budget the attachment is never delivered.
+	concluded := false
+	lastStatus := ""
+	for i := 0; i < dlpPollAttempts && !concluded; i++ {
 		if ctx.Err() != nil {
 			return Attachment{}, ctx.Err()
 		}
@@ -539,6 +698,7 @@ func (c *Client) UploadAttachment(ctx context.Context, acct *auth.Account, threa
 				return Attachment{}, (&UpstreamError{
 					Kind:       ErrKindHandshake,
 					StatusCode: dlpResp.StatusCode,
+					Code:       dlpInconclusiveCode,
 					Message:    fmt.Sprintf("附件 DLP 检查返回 HTTP %d", dlpResp.StatusCode),
 				}).Normalize()
 			}
@@ -547,6 +707,7 @@ func (c *Client) UploadAttachment(ctx context.Context, acct *auth.Account, threa
 				if json.Unmarshal(dlpBody, &dlp) == nil {
 					status := strings.ToUpper(strings.TrimSpace(firstMapStr(dlp, "dlpJobStatus", "DlpJobStatus")))
 					action := strings.ToUpper(strings.TrimSpace(firstMapStr(dlp, "policyAction", "PolicyAction")))
+					lastStatus = status
 					if status == "COMPLETED" || status == "SKIPPED" || status == "NOT_APPLICABLE" {
 						if action != "" && action != "ALLOW" && (strictDLP || action != "WARN") {
 							return Attachment{}, &UpstreamError{
@@ -555,23 +716,37 @@ func (c *Client) UploadAttachment(ctx context.Context, acct *auth.Account, threa
 								Message:    fmt.Sprintf("Amazon Quick DLP 策略拦截了该附件 (%s)", action),
 							}
 						}
+						concluded = true
 						break
 					}
 					if status == "FAILED" || status == "ERROR" {
-						return Attachment{}, &UpstreamError{
+						return Attachment{}, (&UpstreamError{
 							Kind:       ErrKindUpstream,
 							StatusCode: 502,
+							Code:       dlpInconclusiveCode,
 							Message:    fmt.Sprintf("Amazon Quick 附件 DLP 扫描失败 (%s)", status),
-						}
+						}).Normalize()
 					}
 				}
 			}
 		}
-		select {
-		case <-ctx.Done():
-			return Attachment{}, ctx.Err()
-		case <-time.After(600 * time.Millisecond):
+		if i+1 < dlpPollAttempts {
+			select {
+			case <-ctx.Done():
+				return Attachment{}, ctx.Err()
+			case <-time.After(dlpPollInterval):
+			}
 		}
+	}
+	if !concluded {
+		if lastStatus == "" {
+			lastStatus = "unknown"
+		}
+		return Attachment{}, (&UpstreamError{
+			Kind:    ErrKindTimeout,
+			Code:    dlpInconclusiveCode,
+			Message: fmt.Sprintf("Amazon Quick 附件 DLP 扫描在 %d 次轮询内未得出结论（最后状态 %s），已按失败关闭处理，附件未发送", dlpPollAttempts, lastStatus),
+		}).Normalize()
 	}
 
 	// Step 3: Deliver attachment into thread.
