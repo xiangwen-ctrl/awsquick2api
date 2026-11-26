@@ -33,7 +33,7 @@ import (
 	"awsquick2api/internal/upstream"
 )
 
-var appVersion = "0.1.3"
+var appVersion = "0.1.4"
 
 func formatStartupErrorDialog(err error, logFileHint string) string {
 	msg := fmt.Sprintf("启动失败：%s", reqlog.ScrubCredentials(err.Error()))
@@ -124,6 +124,9 @@ func run(showGUIError *bool, logFileHint *string, closeLog *func()) error {
 	}
 	if !config.ValidAPIKey(cfg.APIKey) {
 		return fmt.Errorf("set a valid api_key in config or AWSQUICK_API_KEY")
+	}
+	if !config.ValidAdminKey(cfg.AdminKey) {
+		return fmt.Errorf("set a valid admin_key in config or AWSQUICK_ADMIN_KEY")
 	}
 	anchorRelativePaths(cfg, cfgDir)
 
@@ -451,14 +454,21 @@ func run(showGUIError *bool, logFileHint *string, closeLog *func()) error {
 	return nil
 }
 
-func runExportEncrypted(absCfgPath, cfgDir, outPath string) error {
+func loadConfigOrEnvDefaults(absCfgPath string) (*config.Config, error) {
 	cfg, err := config.Load(absCfgPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			cfg = config.Default()
-		} else {
-			return err
+			return config.Load("")
 		}
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func runExportEncrypted(absCfgPath, cfgDir, outPath string) error {
+	cfg, err := loadConfigOrEnvDefaults(absCfgPath)
+	if err != nil {
+		return err
 	}
 	anchorRelativePaths(cfg, cfgDir)
 	vault, err := auth.OpenOrCreateVault(cfg.EncryptionKeyFile(), os.Getenv("AWSQUICK_ENCRYPTION_KEY"))
@@ -489,13 +499,9 @@ func runExportEncrypted(absCfgPath, cfgDir, outPath string) error {
 }
 
 func runImportEncrypted(absCfgPath, cfgDir, inPath string, overwrite bool) error {
-	cfg, err := config.Load(absCfgPath)
+	cfg, err := loadConfigOrEnvDefaults(absCfgPath)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			cfg = config.Default()
-		} else {
-			return err
-		}
+		return err
 	}
 	anchorRelativePaths(cfg, cfgDir)
 	vault, err := auth.OpenOrCreateVault(cfg.EncryptionKeyFile(), os.Getenv("AWSQUICK_ENCRYPTION_KEY"))

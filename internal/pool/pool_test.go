@@ -348,3 +348,28 @@ func TestUpdateQuotaWakesBlockedWaiter(t *testing.T) {
 		t.Fatal("UpdateQuota did not wake blocked AcquireWith waiter")
 	}
 }
+
+func TestAttachmentAndAdvancedAccountChecksIgnoreDisabled(t *testing.T) {
+	p := New(Config{MaxInFlight: 2})
+	p.SyncAccounts([]*auth.Account{
+		{UID: "soc_disabled", Provider: auth.ProviderSocial, AccessToken: "t1"},
+		{UID: "gw_healthy", Provider: auth.ProviderGateway, AccessToken: "t2", WSHost: "wss://example.aws.dev", WSPath: auth.GatewayWSPath},
+	})
+	p.UpdateQuota("soc_disabled", QuotaInfo{Known: true, AdvancedEnabled: true, AdvancedKnown: true})
+	p.UpdateQuota("gw_healthy", QuotaInfo{Known: true, AdvancedEnabled: true, AdvancedKnown: true})
+	p.Disable("soc_disabled", "token_expired")
+
+	if p.HasAttachmentAccount(false) {
+		t.Fatal("disabled social account must not count as attachment-capable")
+	}
+	if p.HasAttachmentAccount(true) {
+		t.Fatal("disabled social account must not count as advanced attachment-capable")
+	}
+	if !p.HasAdvancedAccount() {
+		t.Fatal("healthy gateway account with AdvancedEnabled should count in HasAdvancedAccount")
+	}
+	_, err := p.AcquireWith(context.Background(), AcquireOptions{RequireAttachments: true, RequireAdvanced: true})
+	if err != ErrNoAttachmentAccounts {
+		t.Fatalf("expected ErrNoAttachmentAccounts, got %v", err)
+	}
+}

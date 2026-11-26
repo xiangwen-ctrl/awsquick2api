@@ -466,12 +466,16 @@ func (p *Pool) SetAdvancedEnabled(uid string, enabled bool) {
 	p.mu.Unlock()
 }
 
-// HasAttachmentAccount reports whether a configured account can upload images.
+// HasAttachmentAccount reports whether an enabled account can upload images.
 func (p *Pool) HasAttachmentAccount(requireAdvanced bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.hasAttachmentAccountLocked(requireAdvanced)
+}
+
+func (p *Pool) hasAttachmentAccountLocked(requireAdvanced bool) bool {
 	for _, e := range p.byUID {
-		if e.acct != nil && !e.acct.IsGateway() && (!requireAdvanced || e.quota.AdvancedEnabled) {
+		if e != nil && e.acct != nil && !e.disabled && !e.acct.IsGateway() && (!requireAdvanced || e.quota.AdvancedEnabled) {
 			return true
 		}
 	}
@@ -482,7 +486,7 @@ func (p *Pool) HasAdvancedAccount() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, e := range p.byUID {
-		if e != nil && !e.disabled && e.quota.AdvancedEnabled {
+		if e != nil && e.acct != nil && !e.disabled && e.quota.AdvancedEnabled {
 			return true
 		}
 	}
@@ -676,7 +680,11 @@ func (p *Pool) AcquireWith(ctx context.Context, opts AcquireOptions) (*Lease, er
 			return &Lease{pool: p, Account: acct}, nil
 		}
 		if !anyEligible {
+			noAttach := opts.RequireAttachments && !p.hasAttachmentAccountLocked(opts.RequireAdvanced)
 			p.mu.Unlock()
+			if noAttach {
+				return nil, ErrNoAttachmentAccounts
+			}
 			if opts.RequireAdvanced {
 				return nil, ErrNoAdvancedAccounts
 			}
@@ -1014,6 +1022,9 @@ const (
 	// ErrNoAdvancedAccounts is returned by AcquireWith(RequireAdvanced) when no eligible
 	// account has advanced models enabled.
 	ErrNoAdvancedAccounts = poolError("no healthy Amazon Quick accounts with advanced models enabled")
+	// ErrNoAttachmentAccounts is returned by AcquireWith(RequireAttachments) when no
+	// enabled account supports uploading image attachments for the requested tier.
+	ErrNoAttachmentAccounts = poolError("no enabled Amazon Quick accounts support image attachments for this model")
 )
 
 var _ = log.Printf

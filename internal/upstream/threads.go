@@ -50,10 +50,15 @@ func Digest(text string) string {
 }
 
 // MessageKey hashes the complete normalized message, including assistant replies.
+// Reasoning text is omitted because clients on /v1/messages, /v1/responses, and
+// standard /v1/chat/completions do not echo it back, and PromptBlocks never sends it.
 func MessageKey(m map[string]any) string {
 	role := msgRole(m)
 	normalized := maps.Clone(m)
 	normalized["role"] = role
+	if role == "assistant" {
+		delete(normalized, "reasoning_content")
+	}
 	switch content := m["content"].(type) {
 	case nil:
 		normalized["content"] = ""
@@ -80,9 +85,6 @@ func MessageKey(m map[string]any) string {
 
 func assistantReplyKey(res ChatResult) string {
 	msg := map[string]any{"role": "assistant", "content": res.Text}
-	if res.Reasoning != "" {
-		msg["reasoning_content"] = res.Reasoning
-	}
 	if len(res.ToolCalls) > 0 {
 		calls := make([]any, 0, len(res.ToolCalls))
 		for _, call := range res.ToolCalls {

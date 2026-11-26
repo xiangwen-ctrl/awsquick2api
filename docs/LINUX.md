@@ -8,9 +8,8 @@
 
 ```bash
 sudo useradd --system --home-dir /opt/awsquick2api --shell /usr/sbin/nologin awsquick2api
+sudo install -o root -g root -m 0755 awsquick2api-linux-amd64 /usr/local/bin/awsquick2api
 sudo install -d -o awsquick2api -g awsquick2api -m 0700 /opt/awsquick2api
-sudo install -o awsquick2api -g awsquick2api -m 0755 awsquick2api-linux-amd64 /opt/awsquick2api/awsquick2api
-sudo chown -R awsquick2api:awsquick2api /opt/awsquick2api
 
 sudo cp deploy/linux/awsquick2api.service /etc/systemd/system/awsquick2api.service
 sudo systemctl daemon-reload
@@ -49,8 +48,11 @@ ssh -L 8045:127.0.0.1:8045 user@YOUR_SERVER
 # 本机导出加密迁移包（输入 ≥ 12 位密码）
 ./awsquick2api -export-encrypted ./accounts.enc.json
 
-# 上传到服务器后以服务用户导入（避免以 root 执行生成无权读取的凭据文件；也可直接在面板「导入」上传）
-sudo -u awsquick2api /opt/awsquick2api/awsquick2api -config /opt/awsquick2api/config.json -import-encrypted /tmp/accounts.enc.json
+# 若服务正在运行，推荐直接通过面板「导入」上传；
+# 如改用命令行离线导入，请先停止服务，以服务用户导入后再重启（避免写入权限错误或与在线刷新竞态）
+sudo systemctl stop awsquick2api
+sudo -u awsquick2api /usr/local/bin/awsquick2api -config /opt/awsquick2api/config.json -import-encrypted /tmp/accounts.enc.json
+sudo systemctl start awsquick2api
 ```
 
 ## 4. 从源码交叉编译

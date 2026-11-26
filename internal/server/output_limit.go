@@ -10,7 +10,7 @@ func outputTokenLimit(body map[string]any, fields ...string) (int, error) {
 	limit := 0
 	for _, name := range fields {
 		raw, exists := body[name]
-		if !exists {
+		if !exists || raw == nil {
 			continue
 		}
 		value, ok := raw.(float64)

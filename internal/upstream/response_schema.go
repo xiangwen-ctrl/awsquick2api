@@ -38,12 +38,27 @@ func compileResponseSchema(format ResponseFormat) (func(any) error, error) {
 
 func (p *preparedTurn) validateJSONOutput(text string) (string, error) {
 	cleaned := CleanJSONOutput(text)
-	var obj map[string]any
+	invalidErr := &UpstreamError{
+		Kind:       ErrKindCompletion,
+		StatusCode: 502,
+		Code:       "invalid_structured_output",
+		Message:    "Amazon Quick returned an invalid response for the requested output format",
+	}
+	if !json.Valid([]byte(cleaned)) {
+		return "", invalidErr
+	}
 	decoder := json.NewDecoder(strings.NewReader(cleaned))
 	decoder.UseNumber()
-	if !json.Valid([]byte(cleaned)) || decoder.Decode(&obj) != nil || obj == nil ||
-		(p.validateSchema != nil && p.validateSchema(obj) != nil) {
-		return "", &UpstreamError{Kind: ErrKindCompletion, StatusCode: 502, Code: "invalid_structured_output", Message: "Amazon Quick returned an invalid response for the requested output format"}
+	if p.validateSchema != nil {
+		var doc any
+		if decoder.Decode(&doc) != nil || p.validateSchema(doc) != nil {
+			return "", invalidErr
+		}
+		return cleaned, nil
+	}
+	var obj map[string]any
+	if decoder.Decode(&obj) != nil || obj == nil {
+		return "", invalidErr
 	}
 	return cleaned, nil
 }

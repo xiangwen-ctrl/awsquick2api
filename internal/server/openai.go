@@ -332,7 +332,9 @@ func writeOpenAINonStreamResponse(w http.ResponseWriter, id string, created int6
 	finishReason := "stop"
 	if res.OutputLimitReached {
 		finishReason = "length"
-		msg["content"] = ""
+		if msg["content"] == nil {
+			msg["content"] = ""
+		}
 	}
 	if len(res.ToolCalls) > 0 {
 		if legacyFunctions {

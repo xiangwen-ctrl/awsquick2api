@@ -108,13 +108,13 @@ wire_api = "responses"
 
 > `aws-quick/<档位>` 与 `qw/<档位>` 形式的 provider 前缀会被自动剥离，例如 `aws-quick/advanced-high` 等价于 `amazon-advanced-high`。`amazon-advanced` 只会调度到已开通 Advanced 的账号；池中没有此类账号时请求返回 `400`。
 
-三个推理入口均支持输出上限。有上限时，网关等待 Amazon Quick 完成并确认实际用量，再返回输出。超限返回各协议的长度结束状态，正文和工具调用为空，usage 记录实际用量。上游生成和额度消耗仍由 Amazon Quick 决定。图片支持符合大小限制的内联 base64 PNG、JPEG、GIF 和 WebP，需要启用附件并有支持附件的账号。
+三个推理入口均校验输出上限（`max_tokens` / `max_completion_tokens` / `max_output_tokens`，允许省略或 `null`）。流式请求保持实时输出与 SSE 心跳保活；若 Amazon Quick 实际用量超过上限，网关会保留已生成内容并以各协议的长度结束状态返回（`length` / `max_tokens` / `incomplete`），usage 记录实际用量。上游生成和额度消耗仍由 Amazon Quick 决定。图片支持符合大小限制的内联 base64 PNG、JPEG、GIF 和 WebP，需要启用附件并有支持附件的账号。
 
 ## 配置说明
 
 完整配置项见 [示例配置](./config.example.json)。面板保存后大部分设置即时生效，包括 `server.trusted_hosts`。修改 `listen`、`auth_dir`、`data_dir` 或服务器的读取超时、退出超时、请求体上限和并发请求体预算时，面板会列出需重启的配置项。Linux 部署及无头登录见 [Linux 部署说明](./docs/LINUX.md)。
 
-使用示例配置时，请先填写自定义 `api_key` 或设置 `AWSQUICK_API_KEY`。空值和示例占位值会导致启动或保存失败。
+使用示例配置时，请先填写自定义的 `api_key` 与 `admin_key`（或通过环境变量 `AWSQUICK_API_KEY` / `AWSQUICK_ADMIN_KEY` 提供）。空值和示例占位值会导致启动或保存失败。
 
 常用配置项补充：
 
@@ -123,8 +123,8 @@ wire_api = "responses"
 | `features.strict_privacy_dlp` | `true` | 严格隐私脱敏：在流式回复与工具调用参数中屏蔽账号邮箱、姓名、ID 及其编码 / 拆字 / 倒序变体（如 `[at]`/`(at)` 混淆邮箱），防止共享 `api_key` 时泄露账号身份。可在面板「模型与接入」页切换；关闭后仅保留基础脱敏。 |
 | `upstream.max_frame_bytes` | `63000` | 单帧上限（字节），用于消息压缩拟合与超限重试。`0` 或负数会被纠正为默认值，最小 `8192`。 |
 | `upstream.single_client_thread_reuse` | `false` | 单一可信调用方的专用实例可显式开启。客户端需传 `X-Aws-Quick-Conversation`，并回传一致的对话历史。升级时旧 `upstream.stateful` 字段不启用复用。 |
-| `server.max_payload_bytes` | 24 MiB | 单请求上限，同时受并发请求体预算约束。 |
-| `server.max_inflight_payload_bytes` | 32 MiB | 推理和 token 估算请求共用的请求体预算，适用于读取、解析及请求处理期间。每个请求至少预留 1 MiB，未知长度按单请求上限预留。 |
+| `server.max_payload_bytes` | 24 MiB | 单请求上限（范围 8 MiB–512 MiB），同时受并发请求体预算约束。 |
+| `server.max_inflight_payload_bytes` | 32 MiB | 推理和 token 估算请求共用的请求体预算（范围 8 MiB–512 MiB）。已知长度请求按请求体大小预留，未知长度（chunked）请求在读取时按实际接收字节递增预留（单请求最低预留 64 KiB），兼顾防 OOM 与高并发流式请求。 |
 | `server.shutdown_timeout_seconds` | `30` | 优雅退出时等待进行中请求（含流式对话）结束的最长时间，超时后才强制中断。 |
 | `server.trusted_hosts` | `[]` | 本机回环监听并配合 Nginx/Caddy TLS 反代访问面板时，额外放行的 `Host` 域名白名单（防 DNS 重绑定；支持热生效）。 |
 
@@ -168,9 +168,8 @@ wire_api = "responses"
 
 ```bash
 sudo useradd --system --home-dir /opt/awsquick2api --shell /usr/sbin/nologin awsquick2api
+sudo install -o root -g root -m 0755 awsquick2api-linux-amd64 /usr/local/bin/awsquick2api
 sudo install -d -o awsquick2api -g awsquick2api -m 0700 /opt/awsquick2api
-sudo install -o awsquick2api -g awsquick2api -m 0755 awsquick2api-linux-amd64 /opt/awsquick2api/awsquick2api
-sudo chown -R awsquick2api:awsquick2api /opt/awsquick2api
 sudo cp deploy/linux/awsquick2api.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now awsquick2api
 ```

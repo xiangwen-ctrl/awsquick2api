@@ -149,9 +149,9 @@ func New(cfg Config) *Panel {
 
 	// Models, Config, Requests (metadata-only), Logs
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.handleModels))
-	p.mux.HandleFunc("PATCH /panel/api/models/claude-aliases", p.withAuth(p.handleClaudeAliasesToggle))
 	p.mux.HandleFunc("PUT /panel/api/models/{slot}/rename", p.withAuth(p.handleModelRename))
 	p.mux.HandleFunc("PATCH /panel/api/models/{id}", p.withAuth(p.handleModelVisibilityToggle))
+	p.mux.HandleFunc("PATCH /panel/api/features/claude-aliases", p.withAuth(p.handleClaudeAliasesToggle))
 	p.mux.HandleFunc("PATCH /panel/api/features/strict-privacy-dlp", p.withAuth(p.handleStrictPrivacyToggle))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.handleConfigGet))
 	p.mux.HandleFunc("PUT /panel/api/config", p.withAuth(p.handleConfigSave))
@@ -182,8 +182,8 @@ func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		if p.cfg.Live != nil {
 			key = strings.TrimSpace(p.cfg.Live.Load().AdminKey)
 		}
-		if key == "" {
-			writeJSON(w, http.StatusForbidden, map[string]any{"error": "panel disabled: admin_key is empty"})
+		if !config.ValidAdminKey(key) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "panel disabled: set a valid admin_key"})
 			return
 		}
 		if !isSameOriginRequest(r) {

@@ -452,3 +452,36 @@ func TestThreadReuseRequiresNewExplicitSetting(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminKeyValidationTrimAndInflightPayloadFloor(t *testing.T) {
+	clearEnv(t)
+	if ValidAdminKey("") || ValidAdminKey("  ") || ValidAdminKey(ExampleAdminKey) {
+		t.Fatal("empty or example admin_key must be invalid")
+	}
+	if !ValidAdminKey("qka_custom_secret") {
+		t.Fatal("custom admin_key should be valid")
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	base := Default()
+	base.APIKey = "qk_valid_key"
+	base.AdminKey = "qka_valid_key"
+	writeJSON(t, path, base)
+
+	// Example admin_key placeholder must be rejected without touching disk.
+	if _, _, err := SaveFull(path, []byte(`{"api_key":"qk_valid_key","admin_key":"replace_with_your_admin_key"}`), base); err == nil {
+		t.Fatal("SaveFull accepted example admin_key placeholder")
+	}
+
+	// Whitespace around admin_key is trimmed and small max_inflight_payload_bytes is clamped to 8 MiB.
+	next, _, err := SaveFull(path, []byte(`{"api_key":" qk_valid_key ","admin_key":" qka_trimmed\n","server":{"max_inflight_payload_bytes":64}}`), base)
+	if err != nil {
+		t.Fatalf("SaveFull failed: %v", err)
+	}
+	if next.AdminKey != "qka_trimmed" {
+		t.Fatalf("AdminKey = %q, want %q", next.AdminKey, "qka_trimmed")
+	}
+	if next.Server.MaxInflightPayloadBytes != 8<<20 {
+		t.Fatalf("MaxInflightPayloadBytes = %d, want %d", next.Server.MaxInflightPayloadBytes, 8<<20)
+	}
+}

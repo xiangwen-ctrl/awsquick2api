@@ -653,3 +653,36 @@ func TestInvalidDisablePayloadLeavesAccountEnabled(t *testing.T) {
 		t.Fatalf("invalid request returned %d, disabled=%v", w.Code, p.Snapshot()[0].Disabled)
 	}
 }
+
+func TestPanelRejectsExampleAdminKeyAndSeparatesClaudeAliasesRoute(t *testing.T) {
+	cfg := config.Default()
+	cfg.AdminKey = config.ExampleAdminKey
+	pnBlocked := New(Config{Live: config.NewLiveHolder(cfg)})
+	r := httptest.NewRequest(http.MethodGet, "/panel/api/overview", nil)
+	r.Host = "127.0.0.1:8045"
+	r.Header.Set("Authorization", "Bearer "+config.ExampleAdminKey)
+	w := httptest.NewRecorder()
+	pnBlocked.ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("example admin_key returned %d, want 403", w.Code)
+	}
+
+	pn, mc, _ := newHardeningPanel(t, nil)
+	host := "127.0.0.1:8045"
+
+	// Dedicated feature route toggles features.claude_aliases.
+	w = doPanelReq(pn, http.MethodPatch, "/panel/api/features/claude-aliases", host, "", testAdminKey, map[string]any{"enabled": false})
+	if w.Code != http.StatusOK || mc.get().Features.ClaudeAliases {
+		t.Fatalf("toggle claude_aliases via /features/ failed: %d enabled=%v", w.Code, mc.get().Features.ClaudeAliases)
+	}
+
+	// Renaming a model slot to "claude-aliases" and toggling its visibility via /models/claude-aliases
+	// must update model visibility instead of colliding with the feature toggle.
+	w = doPanelReq(pn, http.MethodPatch, "/panel/api/models/claude-aliases", host, "", testAdminKey, map[string]any{"visible": false})
+	if w.Code != http.StatusOK {
+		t.Fatalf("model visibility patch for claude-aliases returned %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(strings.Join(mc.get().Models.Hidden, ","), "claude-aliases") {
+		t.Fatalf("expected claude-aliases in hidden models, got %v", mc.get().Models.Hidden)
+	}
+}

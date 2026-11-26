@@ -46,6 +46,7 @@ const (
 	DefaultMaxPayloadBytes         = 24 << 20
 	DefaultMaxInflightPayloadBytes = 32 << 20
 	ExampleAPIKey                  = "replace_with_your_api_key"
+	ExampleAdminKey                = "replace_with_your_admin_key"
 )
 
 type ServerConfig struct {
@@ -218,6 +219,12 @@ func GenerateAdminKey() string { return randomHexKey("qka_") }
 func ValidAPIKey(key string) bool {
 	key = strings.TrimSpace(key)
 	return key != "" && key != ExampleAPIKey
+}
+
+// ValidAdminKey reports whether a configured panel admin key is usable.
+func ValidAdminKey(key string) bool {
+	key = strings.TrimSpace(key)
+	return key != "" && key != ExampleAdminKey
 }
 
 // WriteDefault creates a fresh config.json with independent random api_key and admin_key.
@@ -414,11 +421,17 @@ func (c *Config) normalize() {
 	if c.Server.MaxPayloadBytes > 512<<20 {
 		c.Server.MaxPayloadBytes = 512 << 20
 	}
-	c.Server.MaxInflightPayloadBytes = min(c.Server.MaxInflightPayloadBytes, 512<<20)
 	if c.Server.MaxInflightPayloadBytes <= 0 {
 		c.Server.MaxInflightPayloadBytes = DefaultMaxInflightPayloadBytes
 	}
+	if c.Server.MaxInflightPayloadBytes < 8<<20 {
+		c.Server.MaxInflightPayloadBytes = 8 << 20
+	}
+	if c.Server.MaxInflightPayloadBytes > 512<<20 {
+		c.Server.MaxInflightPayloadBytes = 512 << 20
+	}
 	c.APIKey = strings.TrimSpace(c.APIKey)
+	c.AdminKey = strings.TrimSpace(c.AdminKey)
 	if len(c.Server.TrustedHosts) > 0 {
 		seen := make(map[string]bool, len(c.Server.TrustedHosts))
 		cleaned := make([]string, 0, len(c.Server.TrustedHosts))
@@ -592,12 +605,12 @@ func SaveFull(path string, raw []byte, oldCfg *Config) (*Config, []string, error
 	diskCfg.normalize()
 	if strings.TrimSpace(diskCfg.AdminKey) == "" && strings.TrimSpace(os.Getenv("AWSQUICK_ADMIN_KEY")) == "" {
 		// Never persist an empty admin_key: it would be re-randomized on every
-		// restart. Keep the current key when there is one, otherwise generate once.
+		// restart. Keep the current key when there is a valid one, otherwise generate once.
 		switch {
-		case oldCfg != nil && strings.TrimSpace(oldCfg.AdminKey) != "":
+		case oldCfg != nil && ValidAdminKey(oldCfg.AdminKey):
 			diskCfg.AdminKey = oldCfg.AdminKey
 		default:
-			if prev, perr := LoadFileOnly(path); perr == nil && strings.TrimSpace(prev.AdminKey) != "" {
+			if prev, perr := LoadFileOnly(path); perr == nil && ValidAdminKey(prev.AdminKey) {
 				diskCfg.AdminKey = prev.AdminKey
 			} else {
 				diskCfg.AdminKey = GenerateAdminKey()
@@ -618,6 +631,9 @@ func SaveFull(path string, raw []byte, oldCfg *Config) (*Config, []string, error
 	next.normalize()
 	if !ValidAPIKey(next.APIKey) {
 		return nil, nil, fmt.Errorf("set a valid api_key in config or AWSQUICK_API_KEY")
+	}
+	if !ValidAdminKey(next.AdminKey) {
+		return nil, nil, fmt.Errorf("set a valid admin_key in config or AWSQUICK_ADMIN_KEY")
 	}
 	if err := safefile.WriteAtomic(path, outBytes, 0o600); err != nil {
 		return nil, nil, err

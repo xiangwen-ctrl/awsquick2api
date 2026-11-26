@@ -45,9 +45,9 @@ type ChatRequest struct {
 	imageMessages     []map[string]any
 }
 
-// DelayOutput reports whether output must be checked before opening the downstream stream.
+// DelayOutput reports whether output must be validated before opening the downstream stream.
 func (r ChatRequest) DelayOutput() bool {
-	return r.MaxOutputTokens > 0 || ParseResponseFormat(r.ResponseFormat).Strict
+	return ParseResponseFormat(r.ResponseFormat).Type != "text"
 }
 
 type preparedTurn struct {

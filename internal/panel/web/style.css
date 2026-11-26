@@ -76,6 +76,7 @@ code {
   background: var(--surface-2);
   color: var(--muted);
 }
+.badge:empty { display: none; }
 
 .nav-list { display: flex; flex-direction: column; gap: 4px; flex: 1; }
 .nav-item {

@@ -280,7 +280,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		writeEvent("error", map[string]any{
 			"type": "error",
 			"error": map[string]any{
-				"type":    "api_error",
+				"type":    anthropicErrorType(ue.StatusCode),
 				"message": reqlog.ScrubCredentials(ue.Error()),
 			},
 		})

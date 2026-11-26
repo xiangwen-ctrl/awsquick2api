@@ -157,12 +157,16 @@ func BuildResponseFormatPrompt(rf ResponseFormat) string {
 		return "Output format requirement: Return a single valid JSON object only, with no Markdown code fences and no surrounding prose."
 	case "json_schema":
 		schemaStr := "{}"
+		target := "JSON object"
 		if rf.Schema != nil {
+			if typ, _ := rf.Schema["type"].(string); typ != "" && typ != "object" {
+				target = "JSON value"
+			}
 			if b, err := marshalJSONNoEscape(rf.Schema, false); err == nil {
 				schemaStr = string(b)
 			}
 		}
-		return "Output format requirement: Return a single valid JSON object only, with no Markdown code fences and no surrounding prose, strictly conforming to this JSON Schema:\n" + schemaStr
+		return "Output format requirement: Return a single valid " + target + " only, with no Markdown code fences and no surrounding prose, strictly conforming to this JSON Schema:\n" + schemaStr
 	default:
 		return ""
 	}

@@ -129,3 +129,131 @@ func responsesToolItem(call upstream.ToolCall, spec responseToolSpec) map[string
 	}
 	return item
 }
+
+func resolveResponsesToolChoice(rawTC any, oaTools []any, toolSpecs map[string]responseToolSpec) ([]any, any, error) {
+	if rawTC == nil {
+		return oaTools, nil, nil
+	}
+	filterByAliases := func(allowed map[string]bool) []any {
+		if len(allowed) == 0 {
+			return nil
+		}
+		var out []any
+		for _, entry := range oaTools {
+			tm, _ := entry.(map[string]any)
+			fn, _ := tm["function"].(map[string]any)
+			name, _ := fn["name"].(string)
+			if allowed[name] {
+				out = append(out, entry)
+			}
+		}
+		return out
+	}
+	extractNamedAlias := func(m map[string]any, allowNested bool) string {
+		ns, _ := m["namespace"].(string)
+		name, _ := m["name"].(string)
+		if strings.TrimSpace(name) == "" && allowNested {
+			if fn, ok := m["function"].(map[string]any); ok {
+				name, _ = fn["name"].(string)
+				if strings.TrimSpace(ns) == "" {
+					ns, _ = fn["namespace"].(string)
+				}
+			}
+		}
+		return responseToolAlias(ns, name)
+	}
+	namespaceAliases := func(ns string) map[string]bool {
+		ns = strings.TrimSpace(ns)
+		out := map[string]bool{}
+		if ns == "" {
+			return out
+		}
+		for alias, spec := range toolSpecs {
+			if spec.Namespace == ns {
+				out[alias] = true
+			}
+		}
+		return out
+	}
+
+	switch tc := rawTC.(type) {
+	case string:
+		return oaTools, tc, nil
+	case map[string]any:
+		typ, _ := tc["type"].(string)
+		typ = strings.ToLower(strings.TrimSpace(typ))
+		switch typ {
+		case "auto", "none", "required":
+			return oaTools, typ, nil
+		case "function", "custom":
+			alias := extractNamedAlias(tc, typ == "function")
+			if alias == "" {
+				return nil, nil, fmt.Errorf("tool_choice of type %q requires a tool name", typ)
+			}
+			return oaTools, map[string]any{"type": "function", "function": map[string]any{"name": alias}}, nil
+		case "namespace":
+			ns, _ := tc["name"].(string)
+			if strings.TrimSpace(ns) == "" {
+				ns, _ = tc["namespace"].(string)
+			}
+			ns = strings.TrimSpace(ns)
+			if ns == "" {
+				return nil, nil, fmt.Errorf("namespace tool_choice requires a name")
+			}
+			filtered := filterByAliases(namespaceAliases(ns))
+			if len(filtered) == 0 {
+				return nil, nil, fmt.Errorf("unknown tool namespace %q in tool_choice", ns)
+			}
+			return filtered, "required", nil
+		case "allowed_tools":
+			mode, _ := tc["mode"].(string)
+			mode = strings.ToLower(strings.TrimSpace(mode))
+			if mode == "" {
+				mode = "auto"
+			}
+			if mode != "auto" && mode != "required" {
+				return nil, nil, fmt.Errorf("unsupported allowed_tools mode %q", mode)
+			}
+			allowed := map[string]bool{}
+			list, _ := tc["tools"].([]any)
+			for _, rawItem := range list {
+				item, _ := rawItem.(map[string]any)
+				if item == nil {
+					continue
+				}
+				kind, _ := item["type"].(string)
+				kind = strings.ToLower(strings.TrimSpace(kind))
+				switch kind {
+				case "namespace":
+					ns, _ := item["name"].(string)
+					if strings.TrimSpace(ns) == "" {
+						ns, _ = item["namespace"].(string)
+					}
+					for alias := range namespaceAliases(ns) {
+						allowed[alias] = true
+					}
+				case "", "function", "custom":
+					if alias := extractNamedAlias(item, kind != "custom"); alias != "" {
+						allowed[alias] = true
+					}
+				}
+			}
+			filtered := filterByAliases(allowed)
+			if mode == "required" && len(filtered) == 0 {
+				return nil, nil, fmt.Errorf("allowed_tools with mode=required matched no declared tools")
+			}
+			return filtered, mode, nil
+		case "":
+			if alias := extractNamedAlias(tc, true); alias != "" {
+				return oaTools, map[string]any{"type": "function", "function": map[string]any{"name": alias}}, nil
+			}
+			return oaTools, nil, nil
+		default:
+			// Ignore unsupported hosted tool choices rather than manufacturing a
+			// bogus client-function filter that blocks declared tools.
+			return oaTools, nil, nil
+		}
+	default:
+		return oaTools, nil, nil
+	}
+}

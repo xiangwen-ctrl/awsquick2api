@@ -292,6 +292,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 				"created_at": created,
 				"status":     "failed",
 				"model":      reqModel,
+				"output":     output,
 				"error": map[string]any{
 					"code":    ue.Code,
 					"message": reqlog.ScrubCredentials(ue.Error()),
@@ -519,13 +520,13 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 					callID, _ = item["id"].(string)
 				}
 				name := responsesToolName(item)
-				argsJSON, _ := json.Marshal(map[string]any{"input": customToolInputString(item["input"])})
+				argsJSON := upstream.ArgumentString(map[string]any{"input": customToolInputString(item["input"])})
 				msgs = appendAssistantToolCall(msgs, map[string]any{
 					"id":   callID,
 					"type": "function",
 					"function": map[string]any{
 						"name":      name,
-						"arguments": string(argsJSON),
+						"arguments": argsJSON,
 					},
 				})
 			case "function_call_output", "custom_tool_call_output":
@@ -580,18 +581,9 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 		return upstream.ChatRequest{}, nil, err
 	}
 
-	var toolChoice any
-	if rawTC := body["tool_choice"]; rawTC != nil {
-		switch tc := rawTC.(type) {
-		case string:
-			toolChoice = tc
-		case map[string]any:
-			if name := responsesToolName(tc); name != "" {
-				toolChoice = map[string]any{"type": "function", "function": map[string]any{"name": name}}
-			} else if fn, ok := tc["function"].(map[string]any); ok {
-				toolChoice = map[string]any{"type": "function", "function": fn}
-			}
-		}
+	oaTools, toolChoice, err := resolveResponsesToolChoice(body["tool_choice"], oaTools, toolSpecs)
+	if err != nil {
+		return upstream.ChatRequest{}, nil, err
 	}
 
 	effort := ""

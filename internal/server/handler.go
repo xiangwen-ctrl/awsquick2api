@@ -3,6 +3,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -163,17 +164,73 @@ func (h *Handler) maxQueue() int {
 
 func (h *Handler) withBearerAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		h.serveInference(w, r, next, httpauth.VerifyBearer, writeOpenAIError)
+		h.serveInference(w, r, next, httpauth.VerifyBearer, writeOpenAIError, "payload_too_large")
 	}
 }
 
 func (h *Handler) withAnthropicAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		h.serveInference(w, r, next, httpauth.VerifyAnthropic, writeAnthropicError)
+		h.serveInference(w, r, next, httpauth.VerifyAnthropic, writeAnthropicError, "request_too_large")
 	}
 }
 
+const minPayloadReservation int64 = 64 << 10
+
 type threadSessionContextKey struct{}
+type payloadBudgetContextKey struct{}
+
+type payloadBudgetLease struct {
+	mu           sync.Mutex
+	budget       *semaphore.Weighted
+	held         int64
+	maxHeld      int64
+	tooLargeCode string
+}
+
+func (l *payloadBudgetLease) acquireTo(target int64) bool {
+	if l == nil || l.budget == nil {
+		return true
+	}
+	target = min(max(target, minPayloadReservation), l.maxHeld)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if target <= l.held {
+		return true
+	}
+	delta := target - l.held
+	if !l.budget.TryAcquire(delta) {
+		return false
+	}
+	l.held += delta
+	return true
+}
+
+func (l *payloadBudgetLease) shrink(actualBytes int64) {
+	if l == nil || l.budget == nil {
+		return
+	}
+	target := min(max(actualBytes, minPayloadReservation), l.maxHeld)
+	l.mu.Lock()
+	if target < l.held {
+		diff := l.held - target
+		l.held = target
+		l.budget.Release(diff)
+	}
+	l.mu.Unlock()
+}
+
+func (l *payloadBudgetLease) release() {
+	if l == nil || l.budget == nil {
+		return
+	}
+	l.mu.Lock()
+	held := l.held
+	l.held = 0
+	l.mu.Unlock()
+	if held > 0 {
+		l.budget.Release(held)
+	}
+}
 
 func (h *Handler) serveInference(
 	w http.ResponseWriter,
@@ -181,6 +238,7 @@ func (h *Handler) serveInference(
 	next http.HandlerFunc,
 	verify func(*http.Request, string) bool,
 	writeErr func(http.ResponseWriter, int, string, string),
+	tooLargeCode string,
 ) {
 	key := h.apiKey()
 	if !config.ValidAPIKey(key) || !verify(r, key) {
@@ -191,19 +249,30 @@ func (h *Handler) serveInference(
 		limit := h.cfg.MaxPayloadBytes
 		size := r.ContentLength
 		if size > limit {
-			writeErr(w, http.StatusRequestEntityTooLarge, "invalid_request_error",
+			writeErr(w, http.StatusRequestEntityTooLarge, tooLargeCode,
 				fmt.Sprintf("Request body exceeds limit (%d bytes)", limit))
 			return
 		}
-		if size < 0 {
-			size = limit
+		// Known-length requests reserve their declared size up front; unknown-length
+		// (chunked) requests start at minPayloadReservation and acquire incrementally as
+		// bytes arrive in readBodyLimited so concurrent small chunked streams never starve.
+		initialSize := minPayloadReservation
+		if size > initialSize {
+			initialSize = size
 		}
-		reservation := min(max(size, 1<<20), h.cfg.MaxInflightPayloadBytes)
+		reservation := min(initialSize, h.cfg.MaxInflightPayloadBytes)
 		if !h.payloadBudget.TryAcquire(reservation) {
 			writeErr(w, http.StatusTooManyRequests, "rate_limit_error", "Concurrent request payload budget exhausted")
 			return
 		}
-		defer h.payloadBudget.Release(reservation)
+		lease := &payloadBudgetLease{
+			budget:       h.payloadBudget,
+			held:         reservation,
+			maxHeld:      h.cfg.MaxInflightPayloadBytes,
+			tooLargeCode: tooLargeCode,
+		}
+		defer lease.release()
+		ctx := context.WithValue(r.Context(), payloadBudgetContextKey{}, lease)
 
 		// Only the dedicated conversation header authorizes reuse. Other conversation
 		// identifiers can still be used for choosing an account.
@@ -211,8 +280,9 @@ func (h *Handler) serveInference(
 		if len(id) > 0 && len(id) <= 256 {
 			keyDigest := sha256.Sum256([]byte(key))
 			binding := sha256.Sum256(append(keyDigest[:], id...))
-			r = r.WithContext(context.WithValue(r.Context(), threadSessionContextKey{}, hex.EncodeToString(binding[:])))
+			ctx = context.WithValue(ctx, threadSessionContextKey{}, hex.EncodeToString(binding[:]))
 		}
+		r = r.WithContext(ctx)
 	}
 	next(w, r)
 }
@@ -236,19 +306,45 @@ func (h *Handler) readBodyLimited(
 	if writeErr == nil {
 		writeErr = writeOpenAIError
 	}
+	lease, _ := r.Context().Value(payloadBudgetContextKey{}).(*payloadBudgetLease)
+	tooLargeCode := "payload_too_large"
+	if lease != nil && lease.tooLargeCode != "" {
+		tooLargeCode = lease.tooLargeCode
+	}
 	limit := h.cfg.MaxPayloadBytes
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeErr(w, http.StatusRequestEntityTooLarge, "payload_too_large",
-				fmt.Sprintf("Request body exceeds limit (%d bytes)", limit))
+	var (
+		buf bytes.Buffer
+		tmp [32 << 10]byte
+	)
+	for {
+		n, err := r.Body.Read(tmp[:])
+		if n > 0 {
+			nextLen := int64(buf.Len() + n)
+			if !lease.acquireTo(nextLen) {
+				lease.release()
+				writeErr(w, http.StatusTooManyRequests, "rate_limit_error", "Concurrent request payload budget exhausted")
+				return nil, false
+			}
+			buf.Write(tmp[:n])
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			lease.release()
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeErr(w, http.StatusRequestEntityTooLarge, tooLargeCode,
+					fmt.Sprintf("Request body exceeds limit (%d bytes)", limit))
+				return nil, false
+			}
+			writeErr(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
 			return nil, false
 		}
-		writeErr(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
-		return nil, false
 	}
+	raw := buf.Bytes()
+	lease.shrink(int64(len(raw)))
 	return raw, true
 }
 
@@ -418,6 +514,9 @@ func (h *Handler) runChatTurn(
 			case errors.Is(aerr, pool.ErrPoolBusy):
 				status = http.StatusTooManyRequests
 				code = "pool_busy"
+			case errors.Is(aerr, pool.ErrNoAttachmentAccounts) && lastErr == nil:
+				status = http.StatusBadRequest
+				code = "unsupported_image_input"
 			case errors.Is(aerr, pool.ErrNoAdvancedAccounts) && lastErr == nil && !h.cfg.Pool.HasAdvancedAccount():
 				// Only a pool with no advanced-capable account at all is a client
 				// error. Advanced accounts that exist but are excluded, cooling down
@@ -426,7 +525,7 @@ func (h *Handler) runChatTurn(
 				code = "model_not_available"
 			}
 			ue := &upstream.UpstreamError{StatusCode: status, Code: code, Message: reqlog.ScrubCredentials(aerr.Error())}
-			if code == "model_not_available" {
+			if code == "model_not_available" || code == "unsupported_image_input" {
 				ue.Kind = upstream.ErrKindInvalid
 			}
 			if lastErr != nil {
@@ -444,8 +543,12 @@ func (h *Handler) runChatTurn(
 			lastAcct = acct
 
 			// Proactive refresh if access token is within 2 minutes of expiring.
+			// Use a bounded detached context so a client disconnect mid-refresh
+			// never drops a single-use rotated refresh token from the IdP.
 			if h.cfg.Scheduler != nil && acct.NeedsRefresh(time.Now(), 2*time.Minute) {
-				_ = h.cfg.Scheduler.RefreshOneTokenIfStale(ctx, acct.UID, acct.AccessToken)
+				rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 25*time.Second)
+				_ = h.cfg.Scheduler.RefreshOneTokenIfStale(rctx, acct.UID, acct.AccessToken)
+				rcancel()
 				if fresh := h.cfg.Pool.AuthByUID(acct.UID); fresh != nil {
 					acct = fresh
 				}
@@ -591,7 +694,13 @@ func (h *Handler) runChatTurn(
 				if !wasCommitted && uerr.IsAuthError() && !authRefreshed && h.cfg.Scheduler != nil {
 					authRefreshed = true
 					log.Printf("[server] 401 on acct=%s; attempting token refresh and single retry", acct.UID)
-					rerr := h.cfg.Scheduler.RefreshOneTokenIfStale(ctx, acct.UID, acct.AccessToken)
+					rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 25*time.Second)
+					rerr := h.cfg.Scheduler.RefreshOneTokenIfStale(rctx, acct.UID, acct.AccessToken)
+					rcancel()
+					if ctx.Err() != nil {
+						recordResult(acct, 499, "client_canceled", "client canceled", nil)
+						return nil, &upstream.UpstreamError{StatusCode: 499, Code: "client_canceled", Message: "client canceled"}, false
+					}
 					if fresh := h.cfg.Pool.AuthByUID(acct.UID); fresh != nil && fresh.AccessToken != acct.AccessToken {
 						acct = fresh
 						continue
@@ -735,21 +844,27 @@ func writeUpstreamErrorWithRetryAfter(w http.ResponseWriter, ue *upstream.Upstre
 	}
 	msg := reqlog.ScrubCredentials(ue.Error())
 	if anthropic {
-		etype := "api_error"
-		switch status {
-		case http.StatusBadRequest:
-			etype = "invalid_request_error"
-		case http.StatusUnauthorized:
-			etype = "authentication_error"
-		case http.StatusForbidden:
-			etype = "permission_error"
-		case http.StatusTooManyRequests:
-			etype = "rate_limit_error"
-		case http.StatusGatewayTimeout:
-			etype = "overloaded_error"
-		}
-		writeAnthropicError(w, status, etype, msg)
+		writeAnthropicError(w, status, anthropicErrorType(status), msg)
 		return
 	}
 	writeOpenAIError(w, status, ue.Code, msg)
+}
+
+func anthropicErrorType(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid_request_error"
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case http.StatusGatewayTimeout:
+		return "overloaded_error"
+	default:
+		return "api_error"
+	}
 }

@@ -160,3 +160,19 @@ func TestFatalLogPersistsBeforeFileLogClose(t *testing.T) {
 		t.Fatalf("FATAL line leaked credential: %q", text)
 	}
 }
+
+func TestLoadConfigOrEnvDefaultsAppliesEnvWhenFileMissing(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist.json")
+	wantAuth := filepath.Join(t.TempDir(), "custom-auths")
+	wantData := filepath.Join(t.TempDir(), "custom-data")
+	t.Setenv("AWSQUICK_AUTH_DIR", wantAuth)
+	t.Setenv("AWSQUICK_DATA_DIR", wantData)
+
+	cfg, err := loadConfigOrEnvDefaults(missing)
+	if err != nil {
+		t.Fatalf("loadConfigOrEnvDefaults failed: %v", err)
+	}
+	if cfg.AuthDir != wantAuth || cfg.DataDir != wantData {
+		t.Fatalf("got auth=%q data=%q, want auth=%q data=%q", cfg.AuthDir, cfg.DataDir, wantAuth, wantData)
+	}
+}

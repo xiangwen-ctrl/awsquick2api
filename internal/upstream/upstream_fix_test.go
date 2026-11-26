@@ -680,3 +680,173 @@ func TestWireCBORIndefiniteMapCapAndEventStreamUnsignedBounds(t *testing.T) {
 		t.Fatalf("expected invalid event-stream lengths error for high-bit headersLen, got %v", err)
 	}
 }
+
+func TestDelayOutputCoversStructuredFormatsOnly(t *testing.T) {
+	if (ChatRequest{MaxOutputTokens: 1024}).DelayOutput() {
+		t.Fatal("MaxOutputTokens must not disable live streaming via DelayOutput")
+	}
+	for _, rf := range []any{
+		map[string]any{"type": "json_object"},
+		map[string]any{"type": "json_schema", "json_schema": map[string]any{"name": "x", "strict": false, "schema": map[string]any{"type": "object"}}},
+		map[string]any{"type": "json_schema", "json_schema": map[string]any{"name": "x", "strict": true, "schema": map[string]any{"type": "object"}}},
+	} {
+		if !(ChatRequest{ResponseFormat: rf}).DelayOutput() {
+			t.Fatalf("expected DelayOutput=true for %#v", rf)
+		}
+	}
+}
+
+func TestDelayedStreamingReasoningWithEmptyTextDoesNotEmit(t *testing.T) {
+	srv, _ := newMockQuick(t, func(_ int, _ *websocket.Conn, send func(map[string]any), _ func([]byte)) {
+		send(map[string]any{"type": "thinking_delta", "payload": map[string]any{"delta": "internal thought"}})
+		send(map[string]any{"type": "text_delta", "payload": map[string]any{"delta": "   \n"}})
+		send(map[string]any{"type": "message_complete", "payload": map[string]any{}})
+		send(map[string]any{"type": "turn_completed", "payload": map[string]any{}})
+	})
+	client, acct := mockClient(srv, 65536)
+	var emitted []ChatEvent
+	_, err := client.Chat(context.Background(), acct, ChatRequest{
+		Model:          "amazon-smart",
+		Slot:           "smart",
+		Stream:         true,
+		ResponseFormat: map[string]any{"type": "json_object"},
+		Messages:       []map[string]any{{"role": "user", "content": "hi"}},
+	}, func(ev ChatEvent) {
+		emitted = append(emitted, ev)
+	})
+	if err == nil {
+		t.Fatal("expected invalid_structured_output error for whitespace-only json_object reply")
+	}
+	if len(emitted) != 0 {
+		t.Fatalf("delayed streaming must not emit reasoning/whitespace before validation, got %+v", emitted)
+	}
+}
+
+func TestThreadReuseIgnoresAssistantReasoningContent(t *testing.T) {
+	srv, count := newMockQuick(t, func(_ int, _ *websocket.Conn, send func(map[string]any), _ func([]byte)) {
+		send(map[string]any{"type": "thinking_delta", "payload": map[string]any{"delta": "let me think"}})
+		completeTurn(send, "Answer one.")
+	})
+	client, acct := mockClient(srv, 65536)
+	req1 := ChatRequest{
+		Model:         "amazon-smart",
+		Slot:          "smart",
+		ThreadSession: "sess-rsn",
+		Messages:      []map[string]any{{"role": "user", "content": "Q1"}},
+	}
+	res1, err := client.Chat(context.Background(), acct, req1, nil)
+	if err != nil {
+		t.Fatalf("turn 1 failed: %v", err)
+	}
+	if res1.Reasoning == "" {
+		t.Fatal("expected non-empty reasoning on turn 1")
+	}
+
+	// Turn 2 omits reasoning_content (matching /v1/messages, /v1/responses, and standard OpenAI clients).
+	req2 := ChatRequest{
+		Model:         "amazon-smart",
+		Slot:          "smart",
+		ThreadSession: "sess-rsn",
+		Messages: []map[string]any{
+			{"role": "user", "content": "Q1"},
+			{"role": "assistant", "content": "Answer one."},
+			{"role": "user", "content": "Q2"},
+		},
+	}
+	res2, err := client.Chat(context.Background(), acct, req2, nil)
+	if err != nil {
+		t.Fatalf("turn 2 failed: %v", err)
+	}
+	if !res2.ThreadReused || res2.ThreadID != res1.ThreadID {
+		t.Fatalf("expected thread reuse without echoed reasoning_content (t1=%s t2=%s reused=%v)", res1.ThreadID, res2.ThreadID, res2.ThreadReused)
+	}
+	if count() != 2 {
+		t.Fatalf("expected 2 attempts, got %d", count())
+	}
+}
+
+func TestStrictJSONSchemaSupportsNonObjectRoot(t *testing.T) {
+	arraySchema := map[string]any{
+		"type": "json_schema",
+		"json_schema": map[string]any{
+			"name":   "tags",
+			"strict": true,
+			"schema": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"type": "string"},
+			},
+		},
+	}
+	srv, _ := newMockQuick(t, func(n int, _ *websocket.Conn, send func(map[string]any), _ func([]byte)) {
+		if n == 1 {
+			completeTurn(send, `["alpha","beta"]`)
+			return
+		}
+		completeTurn(send, `{"wrong":true}`)
+	})
+	client, acct := mockClient(srv, 65536)
+	res, err := client.Chat(context.Background(), acct, ChatRequest{
+		Model:          "amazon-smart",
+		Slot:           "smart",
+		ResponseFormat: arraySchema,
+		Messages:       []map[string]any{{"role": "user", "content": "tags"}},
+	}, nil)
+	if err != nil || res.Text != `["alpha","beta"]` {
+		t.Fatalf("expected valid array root to pass strict schema, got res=%q err=%v", res.Text, err)
+	}
+	if _, err := client.Chat(context.Background(), acct, ChatRequest{
+		Model:          "amazon-smart",
+		Slot:           "smart",
+		ResponseFormat: arraySchema,
+		Messages:       []map[string]any{{"role": "user", "content": "tags"}},
+	}, nil); err == nil {
+		t.Fatal("expected object to fail array root strict schema")
+	}
+}
+
+func TestRateLimitSkipsStaleThreadRetryAndNonStreamSkipsLiveOutput(t *testing.T) {
+	srv, count := newMockQuick(t, func(n int, _ *websocket.Conn, send func(map[string]any), _ func([]byte)) {
+		switch n {
+		case 1:
+			completeTurn(send, "ok")
+		case 2:
+			send(map[string]any{"type": "error", "payload": map[string]any{"code": "ThrottlingException", "message": "rate limit exceeded"}})
+		default:
+			completeTurn(send, "unexpected retry")
+		}
+	})
+	client, acct := mockClient(srv, 65536)
+	var nonStreamEvents int
+	_, err := client.Chat(context.Background(), acct, ChatRequest{
+		Model:         "amazon-smart",
+		Slot:          "smart",
+		Stream:        false,
+		ThreadSession: "sess-rl",
+		Messages:      []map[string]any{{"role": "user", "content": "hi"}},
+	}, func(ChatEvent) {
+		nonStreamEvents++
+	})
+	if err != nil {
+		t.Fatalf("turn 1 failed: %v", err)
+	}
+	if nonStreamEvents != 0 {
+		t.Fatalf("non-streaming turn must not invoke streaming onEvent callback, got %d events", nonStreamEvents)
+	}
+	_, err = client.Chat(context.Background(), acct, ChatRequest{
+		Model:         "amazon-smart",
+		Slot:          "smart",
+		Stream:        false,
+		ThreadSession: "sess-rl",
+		Messages: []map[string]any{
+			{"role": "user", "content": "hi"},
+			{"role": "assistant", "content": "ok"},
+			{"role": "user", "content": "next"},
+		},
+	}, nil)
+	if err == nil {
+		t.Fatal("expected rate limit error on turn 2")
+	}
+	if count() != 2 {
+		t.Fatalf("rate-limited resumed thread must not retry on fresh thread, got %d upstream attempts", count())
+	}
+}

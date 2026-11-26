@@ -411,13 +411,13 @@ func (c *Controller) showContextMenu() {
 	}()
 
 	addItem := func(flags uint32, id uintptr, label string) {
-		var ptr uintptr
+		var p *uint16
 		if label != "" {
-			if p, err := windows.UTF16PtrFromString(label); err == nil {
-				ptr = uintptr(unsafe.Pointer(p))
+			if utf16, err := windows.UTF16PtrFromString(label); err == nil {
+				p = utf16
 			}
 		}
-		_, _, _ = procAppendMenuW.Call(hMenu, uintptr(flags), id, ptr)
+		_, _, _ = procAppendMenuW.Call(hMenu, uintptr(flags), id, uintptr(unsafe.Pointer(p)))
 	}
 
 	addItem(mfString, cmdOpenPanel, "打开管理面板")

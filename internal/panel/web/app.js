@@ -147,11 +147,10 @@
     if (!val) return;
     adminKey = val;
     try {
-      await api("/panel/api/overview");
+      await loadAll();
       sessionStorage.setItem(KEY_STORAGE, adminKey);
       $("auth-key-input").value = "";
       showApp();
-      await loadAll();
     } catch (err) {
       adminKey = "";
       showAuthGate("解锁失败：" + err.message);
@@ -666,7 +665,7 @@
   $("btn-toggle-claude-aliases").addEventListener("click", async () => {
     const next = $("btn-toggle-claude-aliases").dataset.enabled !== "1";
     try {
-      await api("/panel/api/models/claude-aliases", { method: "PATCH", body: { enabled: next } });
+      await api("/panel/api/features/claude-aliases", { method: "PATCH", body: { enabled: next } });
       await loadModels();
     } catch (e) { showToast(e.message, true); }
   });

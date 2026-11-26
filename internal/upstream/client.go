@@ -177,8 +177,10 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 		)
 		// When response_format is json_object/json_schema, text must be cleaned and validated
 		// before emission, so even with tools enabled we buffer text instead of streaming raw deltas.
-		liveOutput := onEvent != nil && !req.DelayOutput()
-		streamBridge := pt.bridge && req.Stream && liveOutput && pt.respFmt.Type == "text"
+		// Non-streaming turns never forward deltas downstream, so skip streaming guards and keep
+		// emittedAny false so pre-response retries (e.g. stale-thread fallback) still work.
+		liveOutput := req.Stream && onEvent != nil && !req.DelayOutput()
+		streamBridge := pt.bridge && liveOutput && pt.respFmt.Type == "text"
 		needRsnStream := liveOutput
 		needTextStream := streamBridge || (liveOutput && !pt.bridge && pt.respFmt.Type == "text")
 		initStreamGuards := func() {
@@ -253,14 +255,8 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 			return ChatResult{}, werr
 		}
 
-		if req.MaxOutputTokens > 0 && (!res.Usage.OutputTokensKnown || res.Usage.CompletionTokens > req.MaxOutputTokens) {
-			if thread != nil {
-				c.Threads.Drop(thread.ID)
-			}
-			if !res.Usage.OutputTokensKnown {
-				return ChatResult{}, &UpstreamError{Kind: ErrKindCompletion, StatusCode: 502, Code: "upstream_usage_unavailable", Message: "Amazon Quick did not report valid output token usage"}
-			}
-			return ChatResult{Usage: res.Usage, OutputLimitReached: true, ThreadID: threadID, ThreadReused: thread != nil}, nil
+		if req.MaxOutputTokens > 0 && res.Usage.OutputTokensKnown && res.Usage.CompletionTokens > req.MaxOutputTokens {
+			res.OutputLimitReached = true
 		}
 
 		rsnGuard.Finish()
@@ -299,18 +295,18 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 			}
 			finalText = cleaned
 		}
-		if req.Stream && onEvent != nil {
+		if req.Stream && onEvent != nil && (strings.TrimSpace(finalText) != "" || len(calls) > 0) {
 			if !liveOutput && res.Reasoning != "" {
 				onEvent(ChatEvent{Type: "reasoning", Text: res.Reasoning})
 			}
-			if (!needTextStream || !liveOutput) && finalText != "" {
+			if (!needTextStream || !liveOutput) && strings.TrimSpace(finalText) != "" {
 				onEvent(ChatEvent{Type: "text", Text: finalText})
 			}
 		}
 
 		res.Text = finalText
 		res.ToolCalls = calls
-		if reuse && composed.ExactHistory && !outputRedacted && (strings.TrimSpace(finalText) != "" || len(calls) > 0) {
+		if reuse && composed.ExactHistory && !outputRedacted && !res.OutputLimitReached && (strings.TrimSpace(finalText) != "" || len(calls) > 0) {
 			keys := append(pt.keys, assistantReplyKey(res))
 			c.Threads.Commit(threadID, acctKey, threadSession, composed.CustomDigest, keys)
 		} else if thread != nil {
@@ -330,9 +326,9 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 	if err != nil && matched != nil && ctx.Err() == nil && !emittedAny {
 		var ue *UpstreamError
 		// If a resumed thread failed before any output reached the caller, retry cleanly on a
-		// fresh full-history thread. Handshake, guardrail and invalid-request failures are not
-		// caused by the stale thread, so retrying them only doubles cost.
-		if !errors.As(err, &ue) || (ue.Kind != ErrKindHandshake && ue.Kind != ErrKindBlocked && ue.Kind != ErrKindInvalid && ue.Kind != ErrKindCompletion) {
+		// fresh full-history thread. Handshake, guardrail, rate-limit, completion and invalid-request
+		// failures are not caused by the stale thread, so retrying them only doubles cost.
+		if !errors.As(err, &ue) || (ue.Kind != ErrKindHandshake && ue.Kind != ErrKindBlocked && ue.Kind != ErrKindInvalid && ue.Kind != ErrKindCompletion && !ue.IsRateLimit()) {
 			res, err = runAttempt(nil)
 		}
 	}
