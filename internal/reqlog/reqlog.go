@@ -63,6 +63,8 @@ type Entry struct {
 	ActualModel      string `json:"actual_model,omitempty"`
 	AccountUID       string `json:"account_uid,omitempty"`
 	AccountLabel     string `json:"account_label,omitempty"`
+	KeyID            string `json:"key_id,omitempty"`
+	KeyName          string `json:"key_name,omitempty"`
 	Status           int    `json:"status"`
 	ErrorCode        string `json:"error_code,omitempty"`
 	ErrorMessage     string `json:"error_message,omitempty"`

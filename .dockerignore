@@ -1,0 +1,13 @@
+.git
+.github
+docs/
+auths/
+data/
+storage/
+dist/
+config.json
+*.enc.json
+*.exe
+*.log
+awsquick2api
+awsquick2api-*

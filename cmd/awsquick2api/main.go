@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"awsquick2api/internal/apikeys"
 	"awsquick2api/internal/auth"
 	"awsquick2api/internal/config"
 	"awsquick2api/internal/panel"
@@ -33,7 +34,7 @@ import (
 	"awsquick2api/internal/upstream"
 )
 
-var appVersion = "0.1.4"
+var appVersion = "0.2.0"
 
 func formatStartupErrorDialog(err error, logFileHint string) string {
 	msg := fmt.Sprintf("启动失败：%s", reqlog.ScrubCredentials(err.Error()))
@@ -231,25 +232,40 @@ func run(showGUIError *bool, logFileHint *string, closeLog *func()) error {
 	closeCallbacks := sync.OnceFunc(cbMgr.Close)
 	defer closeCallbacks()
 
+	keyStore, err := apikeys.NewStore(cfg.APIKeysFile())
+	if err != nil {
+		rec.Close()
+		return fmt.Errorf("load api keys from %s: %w", cfg.APIKeysFile(), err)
+	}
+
 	live := config.NewLiveHolder(cfg)
 	var cfgMu sync.Mutex
 	bootCfg := *cfg
 	currentCfg := cfg
 
+	var gw *server.Handler
 	var pn *panel.Panel
 	pn = panel.New(panel.Config{
-		Pool:         p,
-		Vault:        vault,
-		Upstream:     up,
-		Scheduler:    sch,
-		Session:      sess,
-		ReqLog:       rec,
-		Live:         live,
-		CallbackMgr:  cbMgr,
-		AuthDir:      cfg.AuthDir,
-		ConfigPath:   absCfgPath,
-		ModelsPath:   modelsPath,
-		Version:      appVersion,
+		Pool:        p,
+		Vault:       vault,
+		Upstream:    up,
+		Scheduler:   sch,
+		Session:     sess,
+		ReqLog:      rec,
+		APIKeys:     keyStore,
+		Live:        live,
+		CallbackMgr: cbMgr,
+		AuthDir:     cfg.AuthDir,
+		ConfigPath:  absCfgPath,
+		ModelsPath:  modelsPath,
+		LogFilePath: logFilePath,
+		Version:     appVersion,
+		UpstreamHealth: func() any {
+			if gw == nil {
+				return nil
+			}
+			return gw.UpstreamHealth()
+		},
 		EnvOverrides: config.ActiveEnvOverrides,
 		// Effective listen address (after AWSQUICK_LISTEN) for the panel's Host-header guard.
 		ListenAddr:   cfg.Listen,
@@ -309,13 +325,14 @@ func run(showGUIError *bool, logFileHint *string, closeLog *func()) error {
 		},
 	})
 
-	gw := server.NewHandler(server.Config{
+	gw = server.NewHandler(server.Config{
 		Pool:                    p,
 		Upstream:                up,
 		Scheduler:               sch,
 		Session:                 sess,
 		Live:                    live,
 		ReqLog:                  rec,
+		APIKeys:                 keyStore,
 		Panel:                   pn,
 		MaxPayloadBytes:         cfg.Server.MaxPayloadBytes,
 		MaxInflightPayloadBytes: cfg.Server.MaxInflightPayloadBytes,
@@ -410,6 +427,9 @@ func run(showGUIError *bool, logFileHint *string, closeLog *func()) error {
 		closeCallbacks()
 		cancelSch()
 		bgWG.Wait()
+		if ferr := keyStore.Flush(); ferr != nil {
+			log.Printf("WARN: api keys flush on shutdown: %v", ferr)
+		}
 		if ferr := p.Flush(); ferr != nil {
 			log.Printf("WARN: pool flush on shutdown: %v", ferr)
 		}

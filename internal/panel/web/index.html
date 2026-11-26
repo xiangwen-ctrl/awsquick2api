@@ -17,6 +17,10 @@
       <p class="muted">输入 <code>config.json</code> 中的 <code>admin_key</code> 解锁管理面板。</p>
       <form id="auth-form">
         <input id="auth-key-input" type="password" placeholder="qka_..." autocomplete="off" aria-label="面板管理密钥 admin_key" required />
+        <label class="remember-row muted" for="auth-remember">
+          <input id="auth-remember" type="checkbox" />
+          <span>记住登录状态（保存在本机浏览器）</span>
+        </label>
         <button id="btn-auth-submit" type="submit" class="btn primary full">解锁面板</button>
       </form>
       <p id="auth-err" class="err-msg hidden" role="alert"></p>
@@ -36,6 +40,7 @@
       <nav class="nav-list" id="nav-list" role="tablist" aria-label="主导航">
         <button type="button" class="nav-item active" role="tab" aria-selected="true" data-tab="overview">总览与账号池</button>
         <button type="button" class="nav-item" role="tab" aria-selected="false" data-tab="models">模型与接入</button>
+        <button type="button" class="nav-item" role="tab" aria-selected="false" data-tab="keys">访问密钥</button>
         <button type="button" class="nav-item" role="tab" aria-selected="false" data-tab="requests">请求统计</button>
         <button type="button" class="nav-item" role="tab" aria-selected="false" data-tab="config">配置（热生效）</button>
         <button type="button" class="nav-item" role="tab" aria-selected="false" data-tab="logs">运行日志</button>
@@ -50,7 +55,9 @@
       <header class="topbar">
         <h2 id="page-title">总览与账号池</h2>
         <div class="topbar-actions">
+          <span id="health-warn-pill" class="pill warn hidden" title="最近 5 分钟上游响应变慢或 5xx 偏高">上游劣化</span>
           <span id="proto-pill" class="pill info">Quick 1.2.4660</span>
+          <button type="button" id="btn-open-playground" class="btn small">在线测试</button>
           <button type="button" id="btn-refresh-now" class="btn small">立即刷新</button>
           <button type="button" id="btn-add-account" class="btn primary small">+ 添加账号</button>
         </div>
@@ -198,6 +205,36 @@
         </div>
       </section>
 
+      <!-- Tab: Scoped API Keys -->
+      <section id="tab-keys" class="tab-panel">
+        <div class="card">
+          <div class="card-head">
+            <h3>访问密钥（Scoped API Keys）</h3>
+            <button type="button" id="btn-create-key" class="btn primary small">+ 新建访问密钥</button>
+          </div>
+          <div class="tip-banner">
+            访问密钥仅用于推理接口（<code>/v1/*</code>、<code>/messages</code>、<code>/responses</code>），<strong>无法访问管理面板</strong>。本地仅保存 SHA-256 哈希与掩码，明文只在创建时展示一次；<code>config.json</code> 中的主推理密钥 <code>api_key</code> 仍可继续使用。
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>名称 / 掩码</th>
+                  <th>状态</th>
+                  <th>允许模型</th>
+                  <th>有效期</th>
+                  <th>用量 / 限额</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="keys-tbody">
+                <tr><td colspan="6" class="empty">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
       <!-- Tab: Requests -->
       <section id="tab-requests" class="tab-panel">
         <div class="card">
@@ -206,7 +243,7 @@
               <h3>最近请求</h3>
             </div>
             <div class="logs-controls">
-              <input id="requests-filter" type="search" class="filter-input" placeholder="筛选模型 / 账号 / 路径 / 状态..." />
+              <input id="requests-filter" type="search" class="filter-input" placeholder="筛选模型 / 密钥 / 账号 / 路径 / 状态..." />
               <button type="button" id="btn-reload-reqs" class="btn small">刷新</button>
               <button type="button" id="btn-clear-reqs" class="btn danger small">清空记录</button>
             </div>
@@ -218,6 +255,7 @@
                   <th>时间</th>
                   <th>入口</th>
                   <th>模型 (实际)</th>
+                  <th>密钥</th>
                   <th>账号</th>
                   <th>状态 / 错误</th>
                   <th>TTFB / 总耗时</th>
@@ -225,7 +263,7 @@
                 </tr>
               </thead>
               <tbody id="requests-tbody">
-                <tr><td colspan="7" class="empty">暂无请求</td></tr>
+                <tr><td colspan="8" class="empty">暂无请求</td></tr>
               </tbody>
             </table>
           </div>
@@ -234,6 +272,71 @@
 
       <!-- Tab: Config -->
       <section id="tab-config" class="tab-panel">
+        <div class="card">
+          <div class="card-head">
+            <h3>常用配置快捷表单</h3>
+            <button type="button" id="btn-save-quick-cfg" class="btn primary small">应用并保存</button>
+          </div>
+          <div class="quick-cfg-grid">
+            <div class="form-row">
+              <label class="muted" for="qcfg-proxy">出站代理（upstream.proxy_url）</label>
+              <input id="qcfg-proxy" type="text" placeholder="留空直连，如 http://127.0.0.1:7890" />
+            </div>
+            <div class="form-row">
+              <label class="muted" for="qcfg-default-model">默认模型档位（upstream.default_model）</label>
+              <select id="qcfg-default-model">
+                <option value="smart">smart (amazon-smart)</option>
+                <option value="balanced">balanced (amazon-balanced)</option>
+                <option value="fast">fast (amazon-fast)</option>
+                <option value="auto">auto (amazon-auto)</option>
+                <option value="advanced">advanced (amazon-advanced)</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label class="muted" for="qcfg-thinking-policy">思考策略（thinking.policy）</label>
+              <select id="qcfg-thinking-policy">
+                <option value="client">client（优先客户端与模型后缀）</option>
+                <option value="gateway">gateway（优先网关默认/模型覆写）</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label class="muted" for="qcfg-thinking-effort">默认思考强度（thinking.default_effort）</label>
+              <select id="qcfg-thinking-effort">
+                <option value="off">off（关闭）</option>
+                <option value="low">low（低）</option>
+                <option value="medium">medium（中）</option>
+                <option value="high">high（高）</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label class="muted" for="qcfg-strategy">选号策略（pool.selection_strategy）</label>
+              <select id="qcfg-strategy">
+                <option value="weighted">weighted（按剩余额度加权）</option>
+                <option value="round_robin">round_robin（轮询）</option>
+                <option value="sequential">sequential（顺序优先）</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label class="muted" for="qcfg-trusted-hosts">反代信任 Host（server.trusted_hosts）</label>
+              <input id="qcfg-trusted-hosts" type="text" placeholder="逗号分隔，如 quick.example.com" />
+            </div>
+            <div class="form-row">
+              <label class="muted" for="qcfg-cors-origins">推理 CORS 白名单（server.cors_allowed_origins）</label>
+              <input id="qcfg-cors-origins" type="text" placeholder="逗号分隔，如 https://chat.example.com 或 *" />
+            </div>
+          </div>
+          <div class="quick-cfg-checks">
+            <label class="check-inline" for="qcfg-thread-reuse">
+              <input id="qcfg-thread-reuse" type="checkbox" />
+              <span>单客户端线程复用（upstream.single_client_thread_reuse）</span>
+            </label>
+            <label class="check-inline" for="qcfg-web-search">
+              <input id="qcfg-web-search" type="checkbox" />
+              <span>默认开启上游联网搜索（upstream.web_search）</span>
+            </label>
+          </div>
+        </div>
+
         <div class="card">
           <div class="card-head">
             <h3>配置文件编辑器（保存即热生效）</h3>
@@ -256,6 +359,7 @@
             <h3>运行日志（最新在上）</h3>
             <div class="logs-controls">
               <input id="logs-filter" type="search" class="filter-input" placeholder="过滤关键字..." />
+              <button type="button" id="btn-export-logs" class="btn small">导出脱敏日志 (ZIP)</button>
               <button type="button" id="btn-reload-logs" class="btn small">刷新日志</button>
             </div>
           </div>
@@ -263,6 +367,114 @@
         </div>
       </section>
     </main>
+  </div>
+
+  <!-- Modal: Create / Edit Scoped API Key -->
+  <div id="modal-key-edit" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="key-modal-title">
+    <div class="modal-card">
+      <div class="card-head">
+        <h3 id="key-modal-title">新建访问密钥</h3>
+        <button type="button" class="btn ghost small" data-close-modal="modal-key-edit">关闭</button>
+      </div>
+      <input id="key-edit-id" type="hidden" value="" />
+      <div class="form-row">
+        <label class="muted" for="key-edit-name">名称（必填）</label>
+        <input id="key-edit-name" type="text" maxlength="64" placeholder="例如：Cherry Studio / 团队测试" />
+      </div>
+      <div class="form-row">
+        <label class="muted" for="key-edit-models">允许模型（可选，留空表示全部可见模型）</label>
+        <input id="key-edit-models" type="text" placeholder="逗号分隔，如 amazon-smart, amazon-fast" />
+      </div>
+      <div class="form-grid-2">
+        <div class="form-row">
+          <label class="muted" for="key-edit-daily">每日请求上限（0 表示不限）</label>
+          <input id="key-edit-daily" type="number" min="0" step="1" value="0" />
+        </div>
+        <div class="form-row">
+          <label class="muted" for="key-edit-tokens">总 Token 上限（0 表示不限）</label>
+          <input id="key-edit-tokens" type="number" min="0" step="1000" value="0" />
+        </div>
+      </div>
+      <div class="form-row">
+        <label class="muted" for="key-edit-expires">过期时间（可选，留空永不过期）</label>
+        <input id="key-edit-expires" type="datetime-local" />
+      </div>
+      <div class="row-end">
+        <button type="button" id="btn-key-save" class="btn primary">保存</button>
+      </div>
+      <p id="key-edit-err" class="err-msg hidden"></p>
+    </div>
+  </div>
+
+  <!-- Modal: One-Time Scoped Key Plaintext -->
+  <div id="modal-key-secret" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="card-head">
+        <h3>访问密钥已创建（明文仅展示一次）</h3>
+        <button type="button" class="btn ghost small" data-close-modal="modal-key-secret">我已保存</button>
+      </div>
+      <p class="muted">请立即复制保存该密钥。关闭此弹窗后无法再次查看明文（仅保留 SHA-256 哈希与掩码）。</p>
+      <div class="secret-highlight">
+        <input id="key-secret-value" type="text" readonly />
+        <button type="button" id="btn-key-secret-copy" class="btn primary small">复制密钥</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Online Playground -->
+  <div id="modal-playground" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card modal-wide">
+      <div class="card-head">
+        <h3>在线模型连通性测试（Playground）</h3>
+        <button type="button" class="btn ghost small" data-close-modal="modal-playground">关闭</button>
+      </div>
+      <div class="form-grid-2">
+        <div class="form-row">
+          <label class="muted" for="pg-model">目标模型</label>
+          <select id="pg-model">
+            <option value="amazon-smart">amazon-smart</option>
+            <option value="amazon-balanced">amazon-balanced</option>
+            <option value="amazon-fast">amazon-fast</option>
+            <option value="amazon-auto">amazon-auto</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label class="muted" for="pg-effort">思考强度</label>
+          <select id="pg-effort">
+            <option value="">跟随配置 / 模型后缀</option>
+            <option value="off">off（关闭）</option>
+            <option value="low">low（低）</option>
+            <option value="medium">medium（中）</option>
+            <option value="high">high（高）</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row">
+        <label class="check-inline" for="pg-web-search">
+          <input id="pg-web-search" type="checkbox" />
+          <span>本次请求开启上游联网搜索（web_search）</span>
+        </label>
+      </div>
+      <div class="form-row">
+        <label class="muted" for="pg-prompt">测试提示词（单轮，不落盘）</label>
+        <textarea id="pg-prompt" rows="3" placeholder="输入测试内容...">请用一句话确认服务连接正常。</textarea>
+      </div>
+      <div class="row-end">
+        <button type="button" id="btn-pg-run" class="btn primary">发送测试</button>
+      </div>
+      <p id="pg-err" class="err-msg hidden"></p>
+      <div id="pg-result" class="req-detail-body hidden" style="margin-top:12px;">
+        <div id="pg-meta" class="qa-meta-grid"></div>
+        <details id="pg-reasoning-wrap" class="qa-details hidden">
+          <summary>思考过程（Reasoning）</summary>
+          <pre id="pg-reasoning" class="qa-box qa-reasoning" style="margin-top:6px;"></pre>
+        </details>
+        <div>
+          <div class="qa-section-head"><h4>回复内容</h4></div>
+          <pre id="pg-output" class="qa-box"></pre>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- Modal: Add Account (Native OAuth) -->
@@ -273,7 +485,7 @@
         <button type="button" class="btn ghost small" data-close-modal="modal-login">关闭</button>
       </div>
       <div class="tip-banner">
-        <strong>多账号防串号提示：</strong>添加多个账号时，请为每个账号使用<strong>无痕/隐私窗口</strong>或独立浏览器配置文件，<strong>切勿</strong>通过退出前一个 Quick 网页账号来换号（AWS 退出登录会撤销已签发会话）。若本机运行着官方 Quick 桌面端，请先退出以释放 <code>18080</code> 端口。
+        <strong>登录提示：</strong>本机运行时，浏览器完成授权后会自动跳回本地回调端口入池；远程 / Docker 无头部署请展开底部手动回调框粘贴跳转后的完整 URL。如需添加多个不同账号，可切换浏览器配置文件或新窗口以免复用上一个账号的登录态。
       </div>
       <div class="form-grid-2">
         <div class="form-row">

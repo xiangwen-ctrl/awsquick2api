@@ -2,15 +2,35 @@
   "use strict";
 
   const KEY_STORAGE = "awsquick2api_panel_admin_key";
+  const REMEMBER_STORAGE = "awsquick2api_panel_remember";
   const THEME_STORAGE = "awsquick2api_panel_theme";
 
-  let adminKey = sessionStorage.getItem(KEY_STORAGE) || "";
+  let rememberLogin = localStorage.getItem(REMEMBER_STORAGE) === "1";
+  let adminKey = sessionStorage.getItem(KEY_STORAGE) || (rememberLogin ? localStorage.getItem(KEY_STORAGE) || "" : "");
   let inferenceApiKey = "";
   let showPlainKey = false;
   let requestsCache = [];
+  let keysCache = [];
   let logsCache = [];
   let activeLoginId = "";
   let loginPollTimer = null;
+
+  function saveAdminKey(key, remember) {
+    sessionStorage.setItem(KEY_STORAGE, key);
+    if (remember) {
+      localStorage.setItem(REMEMBER_STORAGE, "1");
+      localStorage.setItem(KEY_STORAGE, key);
+    } else {
+      localStorage.removeItem(REMEMBER_STORAGE);
+      localStorage.removeItem(KEY_STORAGE);
+    }
+  }
+
+  function clearAdminKey() {
+    sessionStorage.removeItem(KEY_STORAGE);
+    localStorage.removeItem(KEY_STORAGE);
+    localStorage.removeItem(REMEMBER_STORAGE);
+  }
 
   const $ = (id) => document.getElementById(id);
 
@@ -55,7 +75,7 @@
       body: opts.body !== undefined && typeof opts.body !== "string" ? JSON.stringify(opts.body) : opts.body,
     });
     if (res.status === 401) {
-      sessionStorage.removeItem(KEY_STORAGE);
+      clearAdminKey();
       adminKey = "";
       showAuthGate("面板管理密钥 (admin_key) 无效或已更改，请重新输入。");
       throw new Error("unauthorized");
@@ -77,6 +97,19 @@
     if (!ms) return "-";
     const d = new Date(ms);
     return d.toLocaleTimeString("zh-CN", { hour12: false });
+  }
+
+  function fmtDateTime(ms) {
+    if (!ms) return "-";
+    const d = new Date(ms);
+    return d.toLocaleString("zh-CN", { hour12: false });
+  }
+
+  function toLocalDateTimeInput(ms) {
+    if (!ms) return "";
+    const d = new Date(ms);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
 
   function fmtExpiry(ms) {
@@ -109,6 +142,7 @@
     localStorage.setItem(THEME_STORAGE, light ? "light" : "dark");
   }
   applyTheme(localStorage.getItem(THEME_STORAGE) === "light");
+  if ($("auth-remember")) $("auth-remember").checked = rememberLogin;
 
   function showAuthGate(errText = "") {
     $("app").classList.add("hidden");
@@ -137,6 +171,8 @@
       await loadAll();
       showApp();
     } catch {
+      clearAdminKey();
+      adminKey = "";
       showAuthGate("请先输入正确的 admin_key");
     }
   }
@@ -145,10 +181,11 @@
     e.preventDefault();
     const val = $("auth-key-input").value.trim();
     if (!val) return;
+    rememberLogin = !!$("auth-remember")?.checked;
     adminKey = val;
     try {
       await loadAll();
-      sessionStorage.setItem(KEY_STORAGE, adminKey);
+      saveAdminKey(adminKey, rememberLogin);
       $("auth-key-input").value = "";
       showApp();
     } catch (err) {
@@ -158,7 +195,7 @@
   });
 
   $("btn-logout").addEventListener("click", () => {
-    sessionStorage.removeItem(KEY_STORAGE);
+    clearAdminKey();
     adminKey = "";
     inferenceApiKey = "";
     showAuthGate();
@@ -172,6 +209,7 @@
   const tabTitles = {
     overview: "总览与账号池",
     models: "模型与接入",
+    keys: "访问密钥",
     requests: "请求统计",
     config: "配置（热生效）",
     logs: "运行日志",
@@ -188,6 +226,7 @@
       });
       $("page-title").textContent = tabTitles[tab] || tab;
       if (tab === "models") loadModels();
+      if (tab === "keys") loadKeys();
       if (tab === "requests") loadRequests();
       if (tab === "config") loadConfig();
       if (tab === "logs") loadLogs();
@@ -221,6 +260,18 @@
     const data = await api("/panel/api/overview");
     $("version-badge").textContent = data.version ? "v" + data.version : "";
     $("proto-pill").textContent = `Quick ${data.app_version || "1.2.4660"}`;
+
+    const uh = data.upstream_health;
+    const warnPill = $("health-warn-pill");
+    if (warnPill) {
+      if (uh && uh.degraded) {
+        warnPill.textContent = `上游劣化 (${uh.slow_percent || 0}%慢 / ${uh.fail_percent || 0}%5xx)`;
+        warnPill.title = `近 5 分钟样本 ${uh.samples || 0} 条：慢响应(>=8s) ${uh.slow_count || 0} (${uh.slow_percent || 0}%)，最慢 TTFB ${uh.worst_ttfb_ms || 0}ms，5xx ${uh.fail_count || 0} (${uh.fail_percent || 0}%)`;
+        warnPill.classList.remove("hidden");
+      } else {
+        warnPill.classList.add("hidden");
+      }
+    }
 
     const pool = data.pool || {};
     $("stat-accounts").textContent = `${pool.healthy || 0} / ${pool.total || 0}`;
@@ -723,6 +774,175 @@ wire_api = "responses"`;
     });
   });
 
+  // --- Scoped API Keys ---
+  function splitCSV(raw) {
+    return String(raw || "")
+      .split(/[\n,]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  async function loadKeys() {
+    const data = await api("/panel/api/keys");
+    keysCache = data.keys || [];
+    renderKeys();
+  }
+
+  function renderKeys() {
+    const tbody = $("keys-tbody");
+    if (!keysCache.length) {
+      tbody.innerHTML = `<tr><td colspan="6" class="empty">暂无访问密钥。点击右上角「+ 新建访问密钥」创建带模型/额度限制的子密钥（主密钥 api_key 仍可继续使用）。</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = keysCache.map((k) => {
+      let statusHtml = `<span class="pill ok">启用</span>`;
+      if (!k.enabled) {
+        statusHtml = `<span class="pill err">已禁用</span>`;
+      } else if (k.expired) {
+        statusHtml = `<span class="pill err">已过期</span>`;
+      }
+      const modelsHtml = Array.isArray(k.allowed_models) && k.allowed_models.length
+        ? k.allowed_models.map((m) => `<code>${esc(m)}</code>`).join(" ")
+        : `<span class="muted">全部可见模型</span>`;
+      const expHtml = k.expires_at
+        ? `<div>${esc(fmtExpiry(k.expires_at))}</div><div class="muted" style="font-size:11px;">${esc(fmtDateTime(k.expires_at))}</div>`
+        : `<span class="muted">永不过期</span>`;
+      const dailyLimit = k.max_daily_requests > 0 ? ` / ${k.max_daily_requests}` : "";
+      const tokLimit = k.max_total_tokens > 0 ? ` / ${fmtNum(k.max_total_tokens)}` : "";
+      return `
+        <tr data-kid="${esc(k.id)}">
+          <td>
+            <div><strong>${esc(k.name)}</strong></div>
+            <div class="muted" style="font-size:11.5px;"><code>${esc(k.mask)}</code></div>
+          </td>
+          <td>${statusHtml}</td>
+          <td>${modelsHtml}</td>
+          <td>${expHtml}</td>
+          <td>
+            <div>今日 ${k.daily_requests || 0}${esc(dailyLimit)} · 累计 ${k.total_requests || 0} 次</div>
+            <div class="muted" style="font-size:11px;">${fmtNum(k.total_tokens || 0)}${esc(tokLimit)} tok</div>
+          </td>
+          <td>
+            <div class="btn-group">
+              <button type="button" class="btn small" data-kact="edit" data-kid="${esc(k.id)}">编辑</button>
+              <button type="button" class="btn small" data-kact="toggle" data-kid="${esc(k.id)}">${k.enabled ? "禁用" : "启用"}</button>
+              <button type="button" class="btn danger small" data-kact="delete" data-kid="${esc(k.id)}">删除</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  function openKeyModal(existing = null) {
+    $("key-edit-err").classList.add("hidden");
+    $("key-edit-id").value = existing ? existing.id : "";
+    $("key-modal-title").textContent = existing ? "编辑访问密钥" : "新建访问密钥";
+    $("key-edit-name").value = existing ? existing.name : "";
+    $("key-edit-models").value = existing && Array.isArray(existing.allowed_models) ? existing.allowed_models.join(", ") : "";
+    $("key-edit-daily").value = existing ? String(existing.max_daily_requests || 0) : "0";
+    $("key-edit-tokens").value = existing ? String(existing.max_total_tokens || 0) : "0";
+    $("key-edit-expires").value = existing && existing.expires_at ? toLocalDateTimeInput(existing.expires_at) : "";
+    openModal("modal-key-edit");
+    $("key-edit-name").focus();
+  }
+
+  $("btn-create-key").addEventListener("click", () => openKeyModal(null));
+
+  $("btn-key-save").addEventListener("click", async () => {
+    $("key-edit-err").classList.add("hidden");
+    const id = $("key-edit-id").value.trim();
+    const name = $("key-edit-name").value.trim();
+    const allowedModels = splitCSV($("key-edit-models").value);
+    const maxDaily = Math.max(0, parseInt($("key-edit-daily").value, 10) || 0);
+    const maxTokens = Math.max(0, parseInt($("key-edit-tokens").value, 10) || 0);
+    const expRaw = $("key-edit-expires").value.trim();
+    let expiresAt = 0;
+    if (expRaw) {
+      const parsed = Date.parse(expRaw);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        $("key-edit-err").textContent = "过期时间格式无效";
+        $("key-edit-err").classList.remove("hidden");
+        return;
+      }
+      expiresAt = parsed;
+    }
+    try {
+      if (!name) throw new Error("请输入密钥名称");
+      if (!id) {
+        const res = await api("/panel/api/keys", {
+          method: "POST",
+          body: {
+            name,
+            allowed_models: allowedModels,
+            expires_at: expiresAt,
+            max_daily_requests: maxDaily,
+            max_total_tokens: maxTokens,
+          },
+        });
+        closeModal("modal-key-edit");
+        $("key-secret-value").value = res.plaintext || "";
+        openModal("modal-key-secret");
+        await loadKeys();
+        await loadOverview();
+      } else {
+        await api(`/panel/api/keys/${encodeURIComponent(id)}`, {
+          method: "PATCH",
+          body: {
+            name,
+            allowed_models: allowedModels,
+            expires_at: expiresAt,
+            max_daily_requests: maxDaily,
+            max_total_tokens: maxTokens,
+          },
+        });
+        closeModal("modal-key-edit");
+        showToast("访问密钥已更新");
+        await loadKeys();
+      }
+    } catch (err) {
+      $("key-edit-err").textContent = err.message;
+      $("key-edit-err").classList.remove("hidden");
+    }
+  });
+
+  $("btn-key-secret-copy").addEventListener("click", () => {
+    navigator.clipboard.writeText($("key-secret-value").value).then(() => showToast("已复制访问密钥明文"));
+  });
+
+  $("keys-tbody").addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-kact]");
+    if (!btn) return;
+    const act = btn.dataset.kact;
+    const id = btn.dataset.kid;
+    const rec = keysCache.find((k) => k.id === id);
+    if (!rec) return;
+    if (act === "edit") {
+      openKeyModal(rec);
+      return;
+    }
+    btn.disabled = true;
+    try {
+      if (act === "toggle") {
+        await api(`/panel/api/keys/${encodeURIComponent(id)}`, {
+          method: "PATCH",
+          body: { enabled: !rec.enabled },
+        });
+        showToast(rec.enabled ? "已禁用访问密钥" : "已启用访问密钥");
+      } else if (act === "delete") {
+        if (!confirm(`确认永久删除访问密钥「${rec.name}」(${rec.mask}) 吗？`)) return;
+        await api(`/panel/api/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+        showToast("已删除访问密钥");
+      }
+      await loadKeys();
+      await loadOverview();
+    } catch (err) {
+      showToast(err.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
   // --- Requests (Metadata Only) ---
   async function loadRequests() {
     const data = await api("/panel/api/requests?limit=150");
@@ -733,11 +953,11 @@ wire_api = "responses"`;
   function renderRequests() {
     const q = $("requests-filter").value.trim().toLowerCase();
     const filtered = q ? requestsCache.filter((r) =>
-      `${r.path} ${r.requested_model} ${r.actual_model} ${r.account_label} ${r.status} ${r.error_code} ${r.error_message}`.toLowerCase().includes(q)
+      `${r.path} ${r.requested_model} ${r.actual_model} ${r.key_name || "主密钥"} ${r.account_label} ${r.status} ${r.error_code} ${r.error_message}`.toLowerCase().includes(q)
     ) : requestsCache;
     const tbody = $("requests-tbody");
     if (!filtered.length) {
-      tbody.innerHTML = `<tr><td colspan="7" class="empty">暂无匹配请求</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" class="empty">暂无匹配请求</td></tr>`;
       return;
     }
     tbody.innerHTML = filtered.map((r) => `
@@ -748,6 +968,7 @@ wire_api = "responses"`;
           <div><code>${esc(r.requested_model || r.model_slot)}</code></div>
           ${r.actual_model ? `<div class="muted" style="font-size:11px;">${esc(r.actual_model)}</div>` : ""}
         </td>
+        <td>${r.key_name ? `<span class="badge">${esc(r.key_name)}</span>` : `<span class="muted">主密钥</span>`}</td>
         <td>${esc(r.account_label || r.account_uid || "-")}</td>
         <td>
           <span class="pill ${r.status >= 200 && r.status < 300 ? "ok" : "err"}">${r.status}</span>
@@ -769,9 +990,27 @@ wire_api = "responses"`;
   });
 
   // --- Config ---
+  function fillQuickConfig(cfg) {
+    if (!cfg || typeof cfg !== "object") return;
+    const srv = cfg.server || {};
+    const up = cfg.upstream || {};
+    const pl = cfg.pool || {};
+    const th = cfg.thinking || {};
+    $("qcfg-proxy").value = up.proxy_url || "";
+    $("qcfg-default-model").value = up.default_model || "smart";
+    $("qcfg-thinking-policy").value = th.policy || "client";
+    $("qcfg-thinking-effort").value = th.default_effort || "off";
+    $("qcfg-strategy").value = pl.selection_strategy || "weighted";
+    $("qcfg-trusted-hosts").value = Array.isArray(srv.trusted_hosts) ? srv.trusted_hosts.join(", ") : "";
+    $("qcfg-cors-origins").value = Array.isArray(srv.cors_allowed_origins) ? srv.cors_allowed_origins.join(", ") : "";
+    $("qcfg-thread-reuse").checked = !!up.single_client_thread_reuse;
+    $("qcfg-web-search").checked = !!up.web_search;
+  }
+
   async function loadConfig() {
     const data = await api("/panel/api/config");
     $("config-editor").value = JSON.stringify(data.config, null, 2) + "\n";
+    fillQuickConfig(data.config);
     const banner = $("config-env-banner");
     if (data.env_overrides?.length) {
       banner.textContent = "以下环境变量正在覆盖配置值：" + data.env_overrides.join(", ");
@@ -782,22 +1021,22 @@ wire_api = "responses"`;
     $("config-msg").classList.add("hidden");
     $("config-err").classList.add("hidden");
   }
-  $("btn-reload-config").addEventListener("click", loadConfig);
-  $("btn-save-config").addEventListener("click", async () => {
+
+  async function saveConfigRaw(raw) {
     $("config-msg").classList.add("hidden");
     $("config-err").classList.add("hidden");
     try {
-      const raw = $("config-editor").value;
-      JSON.parse(raw);
+      const parsed = JSON.parse(raw);
       const res = await api("/panel/api/config", { method: "PUT", body: raw });
       if (res.effective_admin_key && res.effective_admin_key !== adminKey) {
         adminKey = res.effective_admin_key;
-        sessionStorage.setItem(KEY_STORAGE, adminKey);
+        saveAdminKey(adminKey, rememberLogin);
       }
       if (typeof res.effective_api_key === "string") {
         inferenceApiKey = res.effective_api_key;
         renderSnippets();
       }
+      fillQuickConfig(parsed);
       const restartNote = res.restart_required?.length ? `（以下字段需重启后生效：${res.restart_required.join(", ")}）` : "（已全部即时热生效）";
       $("config-msg").textContent = "配置已保存 " + restartNote;
       $("config-msg").classList.remove("hidden");
@@ -807,9 +1046,36 @@ wire_api = "responses"`;
       $("config-err").textContent = e.message;
       $("config-err").classList.remove("hidden");
     }
+  }
+
+  $("btn-reload-config").addEventListener("click", loadConfig);
+  $("btn-save-config").addEventListener("click", () => saveConfigRaw($("config-editor").value));
+  $("btn-save-quick-cfg").addEventListener("click", async () => {
+    try {
+      const cfg = JSON.parse($("config-editor").value);
+      cfg.server = cfg.server || {};
+      cfg.upstream = cfg.upstream || {};
+      cfg.pool = cfg.pool || {};
+      cfg.thinking = cfg.thinking || {};
+      cfg.upstream.proxy_url = $("qcfg-proxy").value.trim();
+      cfg.upstream.default_model = $("qcfg-default-model").value;
+      cfg.upstream.single_client_thread_reuse = $("qcfg-thread-reuse").checked;
+      cfg.upstream.web_search = $("qcfg-web-search").checked;
+      cfg.thinking.policy = $("qcfg-thinking-policy").value;
+      cfg.thinking.default_effort = $("qcfg-thinking-effort").value;
+      cfg.pool.selection_strategy = $("qcfg-strategy").value;
+      cfg.server.trusted_hosts = splitCSV($("qcfg-trusted-hosts").value);
+      cfg.server.cors_allowed_origins = splitCSV($("qcfg-cors-origins").value);
+      const formatted = JSON.stringify(cfg, null, 2) + "\n";
+      $("config-editor").value = formatted;
+      await saveConfigRaw(formatted);
+    } catch (e) {
+      $("config-err").textContent = "解析当前配置 JSON 失败：" + e.message;
+      $("config-err").classList.remove("hidden");
+    }
   });
 
-  // --- Logs ---
+  // --- Logs & ZIP Export ---
   async function loadLogs() {
     const data = await api("/panel/api/logs?limit=400");
     logsCache = data.logs || [];
@@ -822,6 +1088,110 @@ wire_api = "responses"`;
   }
   $("logs-filter").addEventListener("input", renderLogs);
   $("btn-reload-logs").addEventListener("click", loadLogs);
+  $("btn-export-logs").addEventListener("click", async () => {
+    const btn = $("btn-export-logs");
+    btn.disabled = true;
+    try {
+      const res = await fetch("/panel/api/logs/export", {
+        headers: { Authorization: `Bearer ${adminKey}` },
+      });
+      if (res.status === 401) {
+        clearAdminKey();
+        adminKey = "";
+        showAuthGate("面板管理密钥 (admin_key) 无效或已更改，请重新输入。");
+        return;
+      }
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try {
+          const j = await res.json();
+          if (j?.error) msg = j.error;
+        } catch {
+          /* ignore */
+        }
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const cd = res.headers.get("Content-Disposition") || "";
+      const m = cd.match(/filename="([^"]+)"/i);
+      const filename = m ? m[1] : "awsquick2api-logs.zip";
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+      showToast("已开始下载脱敏日志 ZIP");
+    } catch (e) {
+      showToast("导出失败：" + e.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // --- Online Playground ---
+  $("btn-open-playground").addEventListener("click", async () => {
+    $("pg-err").classList.add("hidden");
+    try {
+      const data = await api("/panel/api/models");
+      const sel = $("pg-model");
+      const prev = sel.value;
+      const models = (data.models || []).filter((m) => m.name);
+      if (models.length) {
+        sel.innerHTML = models.map((m) => `<option value="${esc(m.name)}">${esc(m.name)}${m.visible ? "" : " (隐藏)"}</option>`).join("");
+        if (models.some((m) => m.name === prev)) sel.value = prev;
+      }
+    } catch {
+      /* keep default model list */
+    }
+    openModal("modal-playground");
+  });
+
+  $("btn-pg-run").addEventListener("click", async () => {
+    const btn = $("btn-pg-run");
+    $("pg-err").classList.add("hidden");
+    $("pg-result").classList.add("hidden");
+    const prompt = $("pg-prompt").value.trim();
+    if (!prompt) {
+      $("pg-err").textContent = "请输入测试提示词";
+      $("pg-err").classList.remove("hidden");
+      return;
+    }
+    btn.disabled = true;
+    const prevLabel = btn.textContent;
+    btn.textContent = "请求中...";
+    try {
+      const body = {
+        model: $("pg-model").value,
+        effort: $("pg-effort").value,
+        prompt,
+      };
+      if ($("pg-web-search").checked) {
+        body.web_search = true;
+      }
+      const res = await api("/panel/api/playground", { method: "POST", body });
+      $("pg-meta").innerHTML = `
+        <div><span class="muted">账号：</span><strong>${esc(res.account || "-")}</strong></div>
+        <div><span class="muted">档位 / 实际模型：</span><code>${esc(res.slot || "-")}</code> / <code>${esc(res.actual_model || "-")}</code></div>
+        <div><span class="muted">TTFB / 总耗时：</span><strong>${res.ttfb_ms || 0} / ${res.total_ms || 0} ms</strong></div>
+        <div><span class="muted">Token：</span>${res.prompt_tokens || 0} + ${res.completion_tokens || 0} = ${res.total_tokens || 0}</div>
+      `;
+      const rw = $("pg-reasoning-wrap");
+      if (res.reasoning && String(res.reasoning).trim()) {
+        $("pg-reasoning").textContent = res.reasoning;
+        rw.classList.remove("hidden");
+      } else {
+        rw.classList.add("hidden");
+      }
+      $("pg-output").textContent = res.text || "(空回复)";
+      $("pg-result").classList.remove("hidden");
+    } catch (e) {
+      $("pg-err").textContent = e.message;
+      $("pg-err").classList.remove("hidden");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = prevLabel;
+    }
+  });
 
   initSession();
 })();

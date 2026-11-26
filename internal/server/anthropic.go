@@ -527,6 +527,7 @@ func anthropicToChatRequest(body map[string]any, headers http.Header) (upstream.
 
 	// Translate tools.
 	var oaTools []any
+	var webSearchPtr *bool
 	if rawTools, ok := body["tools"].([]any); ok {
 		for _, item := range rawTools {
 			tm, ok := item.(map[string]any)
@@ -536,7 +537,13 @@ func anthropicToChatRequest(body map[string]any, headers http.Header) (upstream.
 			// Skip Anthropic server-side built-in tools (web_search_*, web_fetch_*,
 			// code_execution_*, ...): they are typed, carry no input_schema, and are
 			// executed by Anthropic itself, so they must not be bridged as client tools.
+			// When Anthropic's built-in web_search tool is declared, enable Amazon Quick's
+			// native web search for this turn.
 			if typ, _ := tm["type"].(string); typ != "" && typ != "custom" && tm["input_schema"] == nil {
+				if strings.HasPrefix(strings.ToLower(strings.TrimSpace(typ)), "web_search") {
+					t := true
+					webSearchPtr = &t
+				}
 				continue
 			}
 			name, _ := tm["name"].(string)
@@ -626,6 +633,7 @@ func anthropicToChatRequest(body map[string]any, headers http.Header) (upstream.
 		Tools:             oaTools,
 		ToolChoice:        toolChoice,
 		ParallelToolCalls: parallelPtr,
+		WebSearch:         webSearchPtr,
 		ConversationID:    convID,
 	}, nil
 }

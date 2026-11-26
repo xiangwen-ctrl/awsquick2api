@@ -2,7 +2,24 @@
 
 `awsquick2api` 是静态编译的纯 Go 单二进制（支持 `amd64` / `arm64`），无需额外运行时，适合直接部署为 `systemd` 服务。
 
-## 1. 下载并安装
+## 1. 部署方式
+
+### 方式 A：Docker Compose（推荐）
+
+仓库根目录提供了多架构 `Dockerfile` 与 `docker-compose.yml`（默认镜像 `ghcr.io/xiangwen-ctrl/awsquick2api:latest`，支持 `linux/amd64` / `linux/arm64`）：
+
+```bash
+mkdir -p awsquick2api/storage && cd awsquick2api
+curl -fsSLO https://raw.githubusercontent.com/xiangwen-ctrl/awsquick2api/main/docker-compose.yml
+PUID=$(id -u) PGID=$(id -g) docker compose up -d
+docker compose logs -f
+```
+
+- 首次运行会自动在 `./storage/` 下生成 `config.json`、`auths/` 和 `data/`，避免传统单文件挂载因文件不存在被 Docker 建目录的坑。
+- 容器默认仅绑定宿主机 `127.0.0.1:8045`；省略 `PUID`/`PGID` 时默认以非 root 用户 `10001:10001` 运行（需先执行 `sudo chown -R 10001:10001 storage`）。
+- 内置 `/healthz` 健康检查；如需本地构建并配置 Go 代理，可取消 `docker-compose.yml` 中 `build` 注释并设置 `GOPROXY`。
+
+### 方式 B：静态二进制 + systemd
 
 从 [GitHub Releases](https://github.com/xiangwen-ctrl/awsquick2api/releases) 下载对应架构的二进制文件：
 
@@ -23,7 +40,8 @@ sudo systemctl status awsquick2api
 
 ## 2. 访问管理面板
 
-通过 SSH 端口转发在本机打开远程面板：
+- **已配置反代域名**（Nginx / Caddy 等）：直接访问 `https://你的域名/panel/`，并在 `config.json` 的 `server.trusted_hosts`（或环境变量 `AWSQUICK_TRUSTED_HOSTS`）中加入该域名。
+- **未配域名 / 不暴露公网（推荐）**：通过 SSH 端口转发在本机打开远程面板：
 
 ```bash
 ssh -L 8045:127.0.0.1:8045 user@YOUR_SERVER
@@ -36,7 +54,7 @@ ssh -L 8045:127.0.0.1:8045 user@YOUR_SERVER
 ### 方式一：面板手动粘贴回调地址
 
 1. 在面板点击 **「+ 添加账号」** → **「生成一次性授权链接」**。
-2. 在本机浏览器的无痕窗口中打开第 1 步链接完成登录；跳转到无法访问的 `http://localhost:18080/callback?...` 时，复制地址栏完整 URL。
+2. 在本机浏览器中打开第 1 步链接完成登录；跳转到无法访问的 `http://localhost:18080/callback?...` 时，复制地址栏完整 URL。
 3. 展开面板底部的手动粘贴回调框提交该 URL，获得第 2 步 AWS 授权页链接。
 4. 打开第 2 步链接并确认授权，再次复制跳转后的 `http://127.0.0.1:18080/?code=...` 完整 URL 粘贴提交即可。
 

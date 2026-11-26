@@ -55,6 +55,7 @@ type ServerConfig struct {
 	MaxPayloadBytes         int64    `json:"max_payload_bytes"`
 	MaxInflightPayloadBytes int64    `json:"max_inflight_payload_bytes"`
 	TrustedHosts            []string `json:"trusted_hosts,omitempty"`
+	CORSAllowedOrigins      []string `json:"cors_allowed_origins,omitempty"`
 }
 
 type UpstreamConfig struct {
@@ -321,6 +322,7 @@ var envOverrideVars = []string{
 	"AWSQUICK_APP_VERSION",
 	"AWSQUICK_AUTH_DIR",
 	"AWSQUICK_CALLBACK_PORT",
+	"AWSQUICK_CORS_ORIGINS",
 	"AWSQUICK_DATA_DIR",
 	"AWSQUICK_DATA_PLANE_URL",
 	"AWSQUICK_DEFAULT_REGION",
@@ -394,6 +396,15 @@ func (c *Config) applyEnv() {
 		}
 		c.Server.TrustedHosts = hosts
 	}
+	if v := strings.TrimSpace(os.Getenv("AWSQUICK_CORS_ORIGINS")); v != "" {
+		var origins []string
+		for _, part := range strings.Split(v, ",") {
+			if o := strings.TrimSpace(part); o != "" {
+				origins = append(origins, o)
+			}
+		}
+		c.Server.CORSAllowedOrigins = origins
+	}
 }
 
 func (c *Config) normalize() {
@@ -448,6 +459,23 @@ func (c *Config) normalize() {
 			cleaned = append(cleaned, h)
 		}
 		c.Server.TrustedHosts = cleaned
+	}
+	if len(c.Server.CORSAllowedOrigins) > 0 {
+		seen := make(map[string]bool, len(c.Server.CORSAllowedOrigins))
+		cleaned := make([]string, 0, len(c.Server.CORSAllowedOrigins))
+		for _, o := range c.Server.CORSAllowedOrigins {
+			o = strings.TrimRight(strings.TrimSpace(o), "/")
+			if o == "" {
+				continue
+			}
+			low := strings.ToLower(o)
+			if seen[low] {
+				continue
+			}
+			seen[low] = true
+			cleaned = append(cleaned, o)
+		}
+		c.Server.CORSAllowedOrigins = cleaned
 	}
 
 	if strings.TrimSpace(c.Upstream.AppVersion) == "" {
@@ -590,6 +618,7 @@ func (c *Config) AnchorPaths(baseDir string) {
 func (c *Config) StateFile() string         { return filepath.Join(c.DataDir, "state.json") }
 func (c *Config) EncryptionKeyFile() string { return filepath.Join(c.DataDir, "encryption.key") }
 func (c *Config) RequestLogDir() string     { return filepath.Join(c.DataDir, "request-logs") }
+func (c *Config) APIKeysFile() string       { return filepath.Join(c.DataDir, "api-keys.json") }
 
 // SaveFull validates a full JSON configuration document over defaults, writes it atomically,
 // applies env overrides to the returned live Config, and reports fields that require restart.

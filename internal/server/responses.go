@@ -580,6 +580,18 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 	if err != nil {
 		return upstream.ChatRequest{}, nil, err
 	}
+	var webSearchPtr *bool
+	if rawTools, ok := body["tools"].([]any); ok {
+		for _, entry := range rawTools {
+			tm, _ := entry.(map[string]any)
+			typ := strings.ToLower(strings.TrimSpace(fmt.Sprint(tm["type"])))
+			if strings.HasPrefix(typ, "web_search") {
+				t := true
+				webSearchPtr = &t
+				break
+			}
+		}
+	}
 
 	oaTools, toolChoice, err := resolveResponsesToolChoice(body["tool_choice"], oaTools, toolSpecs)
 	if err != nil {
@@ -615,6 +627,7 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 		ToolChoice:        toolChoice,
 		ParallelToolCalls: parallelPtr,
 		ResponseFormat:    responsesTextFormat(body),
+		WebSearch:         webSearchPtr,
 		ConversationID:    convID,
 	}, toolSpecs, nil
 }

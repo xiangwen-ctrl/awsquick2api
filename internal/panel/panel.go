@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"awsquick2api/internal/apikeys"
 	"awsquick2api/internal/auth"
 	"awsquick2api/internal/config"
 	"awsquick2api/internal/httpauth"
@@ -45,21 +46,24 @@ type SaveConfigResult struct {
 }
 
 type Config struct {
-	Pool         *pool.Pool
-	Vault        *auth.Vault
-	Upstream     *upstream.Client
-	Scheduler    *scheduler.Scheduler
-	Session      *session.Router
-	ReqLog       *reqlog.Recorder
-	Live         *config.LiveHolder
-	CallbackMgr  *auth.CallbackManager
-	AuthDir      string
-	ConfigPath   string
-	ModelsPath   string
-	Version      string
-	EnvOverrides func() []string
-	LoadConfig   func() (*config.Config, error)
-	SaveConfig   func(raw []byte) (SaveConfigResult, error)
+	Pool           *pool.Pool
+	Vault          *auth.Vault
+	Upstream       *upstream.Client
+	Scheduler      *scheduler.Scheduler
+	Session        *session.Router
+	ReqLog         *reqlog.Recorder
+	APIKeys        *apikeys.Store
+	Live           *config.LiveHolder
+	CallbackMgr    *auth.CallbackManager
+	AuthDir        string
+	ConfigPath     string
+	ModelsPath     string
+	LogFilePath    string
+	Version        string
+	UpstreamHealth func() any
+	EnvOverrides   func() []string
+	LoadConfig     func() (*config.Config, error)
+	SaveConfig     func(raw []byte) (SaveConfigResult, error)
 
 	// ListenAddr is the effective listen address (after env overrides). When empty the
 	// panel falls back to config.json "listen" via LoadConfig. When it binds a loopback
@@ -147,17 +151,23 @@ func New(cfg Config) *Panel {
 	p.mux.HandleFunc("POST /panel/api/login/{id}/callback-url", p.withAuth(p.handleLoginCallbackURL))
 	p.mux.HandleFunc("DELETE /panel/api/login/{id}", p.withAuth(p.handleLoginCancel))
 
-	// Models, Config, Requests (metadata-only), Logs
+	// Models, Scoped API Keys, Playground, Config, Requests (metadata-only), Logs
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.handleModels))
 	p.mux.HandleFunc("PUT /panel/api/models/{slot}/rename", p.withAuth(p.handleModelRename))
 	p.mux.HandleFunc("PATCH /panel/api/models/{id}", p.withAuth(p.handleModelVisibilityToggle))
 	p.mux.HandleFunc("PATCH /panel/api/features/claude-aliases", p.withAuth(p.handleClaudeAliasesToggle))
 	p.mux.HandleFunc("PATCH /panel/api/features/strict-privacy-dlp", p.withAuth(p.handleStrictPrivacyToggle))
+	p.mux.HandleFunc("GET /panel/api/keys", p.withAuth(p.handleKeysList))
+	p.mux.HandleFunc("POST /panel/api/keys", p.withAuth(p.handleKeyCreate))
+	p.mux.HandleFunc("PATCH /panel/api/keys/{id}", p.withAuth(p.handleKeyUpdate))
+	p.mux.HandleFunc("DELETE /panel/api/keys/{id}", p.withAuth(p.handleKeyDelete))
+	p.mux.HandleFunc("POST /panel/api/playground", p.withAuth(p.handlePlayground))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.handleConfigGet))
 	p.mux.HandleFunc("PUT /panel/api/config", p.withAuth(p.handleConfigSave))
 	p.mux.HandleFunc("GET /panel/api/requests", p.withAuth(p.handleRequests))
 	p.mux.HandleFunc("DELETE /panel/api/requests", p.withAuth(p.handleRequestsClear))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.handleLogs))
+	p.mux.HandleFunc("GET /panel/api/logs/export", p.withAuth(p.handleLogsExport))
 
 	return p
 }
@@ -496,6 +506,14 @@ func (p *Panel) handleOverview(w http.ResponseWriter, _ *http.Request) {
 	if p.cfg.CallbackMgr != nil {
 		activePorts = p.cfg.CallbackMgr.ActivePorts()
 	}
+	var upHealth any
+	if p.cfg.UpstreamHealth != nil {
+		upHealth = p.cfg.UpstreamHealth()
+	}
+	scopedKeysCount := 0
+	if p.cfg.APIKeys != nil {
+		scopedKeysCount = len(p.cfg.APIKeys.List())
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":            p.cfg.Version,
 		"app_version":        appVer,
@@ -507,6 +525,8 @@ func (p *Panel) handleOverview(w http.ResponseWriter, _ *http.Request) {
 		"pool":               p.cfg.Pool.Summary(),
 		"sticky_count":       sticky,
 		"metrics":            metrics,
+		"upstream_health":    upHealth,
+		"scoped_keys_count":  scopedKeysCount,
 	})
 }
 

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"awsquick2api/internal/apikeys"
 	"awsquick2api/internal/auth"
 	"awsquick2api/internal/reqlog"
 	"awsquick2api/internal/upstream"
@@ -21,7 +22,47 @@ func modelOwner(id string) string {
 	return "amazon-quick"
 }
 
-func (h *Handler) handleModels(w http.ResponseWriter, _ *http.Request) {
+func formatModelObject(m upstream.ModelSpec, now int64) map[string]any {
+	inMod := []string{"text"}
+	if m.Caps.Image {
+		inMod = append(inMod, "image")
+	}
+	obj := map[string]any{
+		"id":                m.ID,
+		"object":            "model",
+		"created":           now,
+		"owned_by":          modelOwner(m.ID),
+		"name":              m.Display,
+		"context_length":    m.ContextWindow,
+		"max_output_tokens": m.MaxOutputTokens,
+		"tool_call":         m.Caps.Tools,
+		"reasoning":         m.Caps.Reasoning,
+		"vision":            m.Caps.Image,
+		"modalities": map[string]any{
+			"input":  inMod,
+			"output": []string{"text"},
+		},
+		"limit": map[string]any{
+			"context": m.ContextWindow,
+			"output":  m.MaxOutputTokens,
+		},
+	}
+	if m.Caps.Reasoning {
+		obj["reasoning_options"] = []map[string]any{
+			{"type": "effort", "values": []string{"low", "medium", "high"}},
+			{"type": "toggle"},
+		}
+		obj["supported_reasoning_levels"] = []map[string]string{
+			{"effort": "none"},
+			{"effort": "low"},
+			{"effort": "medium"},
+			{"effort": "high"},
+		}
+	}
+	return obj
+}
+
+func (h *Handler) visibleModelsForRequest(r *http.Request) []upstream.ModelSpec {
 	snap := h.loadSnapshot()
 	cat := h.catalog()
 	hasAdv := false
@@ -36,38 +77,56 @@ func (h *Handler) handleModels(w http.ResponseWriter, _ *http.Request) {
 		snap.ExposeEffortVariants,
 		hasAdv,
 	)
+	sk := scopedKeyFromRequest(r)
+	if sk == nil || len(sk.AllowedModels) == 0 {
+		return models
+	}
+	slotID := make(map[string]string, len(cat.Specs))
+	for _, s := range cat.Specs {
+		slotID[strings.ToLower(strings.TrimSpace(s.Slot))] = s.ID
+	}
+	filtered := make([]upstream.ModelSpec, 0, len(models))
+	for _, m := range models {
+		cands := []string{m.ID, m.Slot}
+		if base := slotID[strings.ToLower(strings.TrimSpace(m.Slot))]; base != "" &&
+			strings.HasPrefix(strings.ToLower(m.ID), strings.ToLower(base)+"-") {
+			cands = append(cands, base)
+		}
+		if apikeys.ModelAllowed(sk, cands) {
+			filtered = append(filtered, m)
+		}
+	}
+	return filtered
+}
+
+func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
+	models := h.visibleModelsForRequest(r)
 	now := time.Now().Unix()
 	data := make([]map[string]any, 0, len(models))
 	for _, m := range models {
-		inMod := []string{"text"}
-		if m.Caps.Image {
-			inMod = append(inMod, "image")
-		}
-		data = append(data, map[string]any{
-			"id":                m.ID,
-			"object":            "model",
-			"created":           now,
-			"owned_by":          modelOwner(m.ID),
-			"name":              m.Display,
-			"context_length":    m.ContextWindow,
-			"max_output_tokens": m.MaxOutputTokens,
-			"tool_call":         m.Caps.Tools,
-			"reasoning":         m.Caps.Reasoning,
-			"vision":            m.Caps.Image,
-			"modalities": map[string]any{
-				"input":  inMod,
-				"output": []string{"text"},
-			},
-			"limit": map[string]any{
-				"context": m.ContextWindow,
-				"output":  m.MaxOutputTokens,
-			},
-		})
+		data = append(data, formatModelObject(m, now))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
 		"data":   data,
 	})
+}
+
+func (h *Handler) handleModelGet(w http.ResponseWriter, r *http.Request) {
+	want := strings.TrimSpace(r.PathValue("id"))
+	if want == "" {
+		writeOpenAIError(w, http.StatusNotFound, "model_not_found", "model not found")
+		return
+	}
+	models := h.visibleModelsForRequest(r)
+	now := time.Now().Unix()
+	for _, m := range models {
+		if strings.EqualFold(m.ID, want) {
+			writeJSON(w, http.StatusOK, formatModelObject(m, now))
+			return
+		}
+	}
+	writeOpenAIError(w, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q not found", want))
 }
 
 func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {

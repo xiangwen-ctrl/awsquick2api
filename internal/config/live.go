@@ -11,6 +11,7 @@ type LiveSnapshot struct {
 	APIKey               string
 	AdminKey             string
 	TrustedHosts         []string
+	CORSAllowedOrigins   []string
 	Upstream             UpstreamConfig
 	Thinking             ThinkingConfig
 	SoftCooldown         time.Duration
@@ -82,10 +83,15 @@ func SnapshotFromConfig(cfg *Config) LiveSnapshot {
 	if len(cfg.Server.TrustedHosts) > 0 {
 		trustedHosts = append([]string(nil), cfg.Server.TrustedHosts...)
 	}
+	var corsOrigins []string
+	if len(cfg.Server.CORSAllowedOrigins) > 0 {
+		corsOrigins = append([]string(nil), cfg.Server.CORSAllowedOrigins...)
+	}
 	return LiveSnapshot{
 		APIKey:               cfg.APIKey,
 		AdminKey:             cfg.AdminKey,
 		TrustedHosts:         trustedHosts,
+		CORSAllowedOrigins:   corsOrigins,
 		Upstream:             cfg.Upstream,
 		Thinking:             th,
 		SoftCooldown:         time.Duration(cfg.Pool.SoftCooldownSec) * time.Second,

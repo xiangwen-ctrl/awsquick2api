@@ -1,0 +1,28 @@
+services:
+  awsquick2api:
+    image: ghcr.io/xiangwen-ctrl/awsquick2api:latest
+    # 本地从源码构建请取消注释（国内网络可将 GOPROXY 设为 https://goproxy.cn,direct）：
+    # build:
+    #   context: .
+    #   args:
+    #     GOPROXY: https://proxy.golang.org,direct
+    container_name: awsquick2api
+    restart: unless-stopped
+    user: "${PUID:-10001}:${PGID:-10001}"
+    ports:
+      # 默认仅绑定宿主机回环地址，防止面板与网关暴露到公网；需局域网访问可改为 "8045:8045"
+      - "127.0.0.1:8045:8045"
+    environment:
+      - AWSQUICK_LISTEN=0.0.0.0:8045
+      # 可选：反代域名白名单 / 浏览器前端 CORS 白名单 / 出站代理
+      # - AWSQUICK_TRUSTED_HOSTS=quick.example.com
+      # - AWSQUICK_CORS_ORIGINS=https://chat.example.com
+      # - AWSQUICK_PROXY_URL=http://host.docker.internal:7890
+      # 可选：覆盖密钥（不会写入 config.json）
+      # - AWSQUICK_API_KEY=qk_your_api_key
+      # - AWSQUICK_ADMIN_KEY=qka_your_admin_key
+    volumes:
+      # 首次启动会在 ./storage 自动生成 config.json、auths/ 与 data/
+      # 若宿主机目录非 10001 所有，请先执行：mkdir -p storage && chown -R 10001:10001 storage
+      # 或指定 PUID=$(id -u) PGID=$(id -g) 启动
+      - ./storage:/app/storage

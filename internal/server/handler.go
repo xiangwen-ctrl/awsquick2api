@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/sync/semaphore"
 
+	"awsquick2api/internal/apikeys"
 	"awsquick2api/internal/auth"
 	"awsquick2api/internal/config"
 	"awsquick2api/internal/httpauth"
@@ -40,6 +41,7 @@ type Config struct {
 	Session                 *session.Router
 	Live                    *config.LiveHolder
 	ReqLog                  *reqlog.Recorder
+	APIKeys                 *apikeys.Store
 	Panel                   http.Handler
 	MaxPayloadBytes         int64
 	MaxInflightPayloadBytes int64
@@ -54,6 +56,7 @@ type Handler struct {
 	cfg           Config
 	mux           *http.ServeMux
 	payloadBudget *semaphore.Weighted
+	health        *UpstreamHealthTracker
 }
 
 func NewHandler(cfg Config) *Handler {
@@ -74,11 +77,13 @@ func NewHandler(cfg Config) *Handler {
 		cfg:           cfg,
 		mux:           http.NewServeMux(),
 		payloadBudget: semaphore.NewWeighted(cfg.MaxInflightPayloadBytes),
+		health:        NewUpstreamHealthTracker(),
 	}
 
 	// OpenAI Chat Completions & Models
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withBearerAuth(h.handleOpenAIChat))
 	h.mux.HandleFunc("GET /v1/models", h.withDualAuth(h.handleModels))
+	h.mux.HandleFunc("GET /v1/models/{id}", h.withDualAuth(h.handleModelGet))
 
 	// Anthropic Messages (both /v1/messages and /messages aliases for Claude Code)
 	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.handleAnthropicMessages))
@@ -105,8 +110,67 @@ func NewHandler(cfg Config) *Handler {
 	return h
 }
 
+// UpstreamHealth returns the 5-minute sliding window upstream latency/5xx health summary.
+func (h *Handler) UpstreamHealth() UpstreamHealthSnapshot {
+	if h == nil {
+		return UpstreamHealthSnapshot{WindowSeconds: int(upHealthWindow / time.Second)}
+	}
+	return h.health.Snapshot()
+}
+
+func isInferencePath(path string) bool {
+	return strings.HasPrefix(path, "/v1/") ||
+		path == "/messages" || strings.HasPrefix(path, "/messages/") ||
+		path == "/responses" || strings.HasPrefix(path, "/responses/")
+}
+
+func matchCORSOrigin(origin string, allowed []string) (string, bool) {
+	origin = strings.TrimRight(strings.TrimSpace(origin), "/")
+	if origin == "" || len(allowed) == 0 {
+		return "", false
+	}
+	for _, a := range allowed {
+		if a == "*" {
+			return "*", true
+		}
+		if strings.EqualFold(a, origin) {
+			return origin, true
+		}
+	}
+	return "", false
+}
+
+func hasWildcardOrigin(allowed []string) bool {
+	for _, a := range allowed {
+		if a == "*" {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if isInferencePath(r.URL.Path) {
+		if origins := h.loadSnapshot().CORSAllowedOrigins; len(origins) > 0 {
+			if !hasWildcardOrigin(origins) {
+				w.Header().Add("Vary", "Origin")
+			}
+			if origin := r.Header.Get("Origin"); origin != "" {
+				if allow, ok := matchCORSOrigin(origin, origins); ok {
+					w.Header().Set("Access-Control-Allow-Origin", allow)
+					w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+					w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version, anthropic-beta, x-aws-quick-conversation, session-id")
+					w.Header().Set("Access-Control-Expose-Headers", "X-Request-Id, X-Quick-Account, X-Quick-Actual-Model, X-Quick-Thread-Reused, X-Quick-Usage")
+					w.Header().Set("Access-Control-Max-Age", "600")
+					if r.Method == http.MethodOptions {
+						w.WriteHeader(http.StatusNoContent)
+						return
+					}
+				}
+			}
+		}
+	}
 	h.mux.ServeHTTP(w, r)
 }
 
@@ -164,13 +228,13 @@ func (h *Handler) maxQueue() int {
 
 func (h *Handler) withBearerAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		h.serveInference(w, r, next, httpauth.VerifyBearer, writeOpenAIError, "payload_too_large")
+		h.serveInference(w, r, next, httpauth.ExtractBearer, writeOpenAIError, "payload_too_large")
 	}
 }
 
 func (h *Handler) withAnthropicAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		h.serveInference(w, r, next, httpauth.VerifyAnthropic, writeAnthropicError, "request_too_large")
+		h.serveInference(w, r, next, httpauth.ExtractAnthropic, writeAnthropicError, "request_too_large")
 	}
 }
 
@@ -178,6 +242,39 @@ const minPayloadReservation int64 = 64 << 10
 
 type threadSessionContextKey struct{}
 type payloadBudgetContextKey struct{}
+type scopedKeyContextKey struct{}
+
+func scopedKeyFromRequest(r *http.Request) *apikeys.KeyView {
+	if r == nil {
+		return nil
+	}
+	sk, _ := r.Context().Value(scopedKeyContextKey{}).(*apikeys.KeyView)
+	return sk
+}
+
+func (h *Handler) authenticateInference(r *http.Request, extract func(*http.Request) string) (rawKey string, sk *apikeys.KeyView, status int, code, msg string) {
+	master := h.apiKey()
+	if !config.ValidAPIKey(master) {
+		return "", nil, http.StatusUnauthorized, "authentication_error", "Invalid or missing API key"
+	}
+	presented := strings.TrimSpace(extract(r))
+	if presented == "" {
+		return "", nil, http.StatusUnauthorized, "authentication_error", "Invalid or missing API key"
+	}
+	if httpauth.Equal(presented, master) {
+		return presented, nil, 0, "", ""
+	}
+	if h.cfg.APIKeys != nil {
+		res := h.cfg.APIKeys.Authenticate(presented)
+		if res.Matched {
+			if res.DeniedStatus != 0 {
+				return "", nil, res.DeniedStatus, res.DeniedCode, res.DeniedMessage
+			}
+			return presented, res.Key, 0, "", ""
+		}
+	}
+	return "", nil, http.StatusUnauthorized, "authentication_error", "Invalid or missing API key"
+}
 
 type payloadBudgetLease struct {
 	mu           sync.Mutex
@@ -232,23 +329,41 @@ func (l *payloadBudgetLease) release() {
 	}
 }
 
+const maxDrainExcessBytes int64 = 8 << 20
+
+// drainExcessBody drains a bounded slice of an oversized request body with a short
+// deadline so HTTP/1.1 clients reliably receive the JSON 413 response instead of a
+// TCP connection reset.
+func drainExcessBody(w http.ResponseWriter, body io.Reader) {
+	if body == nil {
+		return
+	}
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _ = io.CopyN(io.Discard, body, maxDrainExcessBytes)
+}
+
 func (h *Handler) serveInference(
 	w http.ResponseWriter,
 	r *http.Request,
 	next http.HandlerFunc,
-	verify func(*http.Request, string) bool,
+	extract func(*http.Request) string,
 	writeErr func(http.ResponseWriter, int, string, string),
 	tooLargeCode string,
 ) {
-	key := h.apiKey()
-	if !config.ValidAPIKey(key) || !verify(r, key) {
-		writeErr(w, http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
+	key, sk, errStatus, errCode, errMsg := h.authenticateInference(r, extract)
+	if errStatus != 0 {
+		writeErr(w, errStatus, errCode, errMsg)
 		return
+	}
+	ctx := r.Context()
+	if sk != nil {
+		ctx = context.WithValue(ctx, scopedKeyContextKey{}, sk)
 	}
 	if r.Method == http.MethodPost {
 		limit := h.cfg.MaxPayloadBytes
 		size := r.ContentLength
 		if size > limit {
+			drainExcessBody(w, r.Body)
 			writeErr(w, http.StatusRequestEntityTooLarge, tooLargeCode,
 				fmt.Sprintf("Request body exceeds limit (%d bytes)", limit))
 			return
@@ -272,7 +387,7 @@ func (h *Handler) serveInference(
 			tooLargeCode: tooLargeCode,
 		}
 		defer lease.release()
-		ctx := context.WithValue(r.Context(), payloadBudgetContextKey{}, lease)
+		ctx = context.WithValue(ctx, payloadBudgetContextKey{}, lease)
 
 		// Only the dedicated conversation header authorizes reuse. Other conversation
 		// identifiers can still be used for choosing an account.
@@ -282,17 +397,19 @@ func (h *Handler) serveInference(
 			binding := sha256.Sum256(append(keyDigest[:], id...))
 			ctx = context.WithValue(ctx, threadSessionContextKey{}, hex.EncodeToString(binding[:]))
 		}
-		r = r.WithContext(ctx)
 	}
-	next(w, r)
+	next(w, r.WithContext(ctx))
 }
 
 func (h *Handler) withDualAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := h.apiKey()
-		if !config.ValidAPIKey(key) || !httpauth.VerifyDual(r, key) {
-			writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
+		_, sk, errStatus, errCode, errMsg := h.authenticateInference(r, httpauth.ExtractAnthropic)
+		if errStatus != 0 {
+			writeOpenAIError(w, errStatus, errCode, errMsg)
 			return
+		}
+		if sk != nil {
+			r = r.WithContext(context.WithValue(r.Context(), scopedKeyContextKey{}, sk))
 		}
 		next(w, r)
 	}
@@ -312,7 +429,8 @@ func (h *Handler) readBodyLimited(
 		tooLargeCode = lease.tooLargeCode
 	}
 	limit := h.cfg.MaxPayloadBytes
-	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	origBody := r.Body
+	r.Body = http.MaxBytesReader(w, origBody, limit)
 	var (
 		buf bytes.Buffer
 		tmp [32 << 10]byte
@@ -335,6 +453,7 @@ func (h *Handler) readBodyLimited(
 			lease.release()
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
+				drainExcessBody(w, origBody)
 				writeErr(w, http.StatusRequestEntityTooLarge, tooLargeCode,
 					fmt.Sprintf("Request body exceeds limit (%d bytes)", limit))
 				return nil, false
@@ -409,6 +528,18 @@ func (h *Handler) runChatTurn(
 			Message:    fmt.Sprintf("model %q is not allowed on this gateway", reqModel),
 		}
 	}
+	sk := scopedKeyFromRequest(r)
+	if sk != nil && len(sk.AllowedModels) > 0 {
+		cands := modelCandidates(cat, reqModel, slot, spec, suffixEffort, known)
+		if !known || !apikeys.ModelAllowed(sk, cands) {
+			return nil, &upstream.UpstreamError{
+				Kind:       upstream.ErrKindInvalid,
+				StatusCode: http.StatusForbidden,
+				Code:       "model_not_allowed",
+				Message:    fmt.Sprintf("model %q is not allowed for this API key", reqModel),
+			}
+		}
+	}
 	// The advanced tier is only served by accounts whose quota reports AdvancedEnabled;
 	// routing it to ordinary accounts would fail upstream and wrongly penalise them.
 	requireAdvanced := slot == "advanced"
@@ -454,6 +585,21 @@ func (h *Handler) runChatTurn(
 	)
 
 	recordResult := func(acct *auth.Account, status int, errCode, errMsg string, out *turnOutcome) {
+		var ttfb time.Duration
+		if out != nil && !out.FirstEventAt.IsZero() {
+			ttfb = out.FirstEventAt.Sub(start)
+		}
+		h.health.Record(status, ttfb)
+		if status == http.StatusOK && sk != nil && h.cfg.APIKeys != nil {
+			toks := 0
+			if out != nil {
+				toks = out.Result.Usage.TotalTokens
+				if toks == 0 {
+					toks = out.Result.Usage.PromptTokens + out.Result.Usage.CompletionTokens
+				}
+			}
+			h.cfg.APIKeys.RecordUsage(sk.ID, toks)
+		}
 		if h.cfg.ReqLog == nil {
 			return
 		}
@@ -470,6 +616,10 @@ func (h *Handler) runChatTurn(
 			TotalMs:        time.Since(start).Milliseconds(),
 			EmptyRetried:   emptyRetried,
 		}
+		if sk != nil {
+			e.KeyID = sk.ID
+			e.KeyName = sk.Name
+		}
 		if acct != nil {
 			e.AccountUID = acct.UID
 			e.AccountLabel = acct.DisplayName()
@@ -481,7 +631,7 @@ func (h *Handler) runChatTurn(
 			e.CompletionTokens = out.Result.Usage.CompletionTokens
 			e.CacheReadTokens = out.Result.Usage.CacheReadTokens
 			if !out.FirstEventAt.IsZero() {
-				e.TTFBMs = out.FirstEventAt.Sub(start).Milliseconds()
+				e.TTFBMs = ttfb.Milliseconds()
 			}
 		}
 		h.cfg.ReqLog.Record(e)
@@ -775,11 +925,7 @@ func opaqueAccountID(uid string) string {
 	return hex.EncodeToString(sum[:])[:12]
 }
 
-// modelPermitted enforces models.allowed / models.hidden at inference time so that
-// callers cannot bypass the GET /v1/models visibility rules by naming a model directly
-// or sending an unknown model name that falls back to the default slot.
-// The resolved default is subject to the same policy when the client omits the model.
-func modelPermitted(snap config.LiveSnapshot, cat *upstream.ModelCatalog, reqModel, slot string, spec upstream.ModelSpec, suffixEffort string, known bool) bool {
+func modelCandidates(cat *upstream.ModelCatalog, reqModel, slot string, spec upstream.ModelSpec, suffixEffort string, known bool) []string {
 	key := strings.ToLower(strings.TrimSpace(reqModel))
 	if idx := strings.LastIndexByte(key, '/'); idx >= 0 {
 		key = key[idx+1:]
@@ -800,6 +946,15 @@ func modelPermitted(snap config.LiveSnapshot, cat *upstream.ModelCatalog, reqMod
 			}
 		}
 	}
+	return cands
+}
+
+// modelPermitted enforces models.allowed / models.hidden at inference time so that
+// callers cannot bypass the GET /v1/models visibility rules by naming a model directly
+// or sending an unknown model name that falls back to the default slot.
+// The resolved default is subject to the same policy when the client omits the model.
+func modelPermitted(snap config.LiveSnapshot, cat *upstream.ModelCatalog, reqModel, slot string, spec upstream.ModelSpec, suffixEffort string, known bool) bool {
+	cands := modelCandidates(cat, reqModel, slot, spec, suffixEffort, known)
 	for _, c := range cands {
 		if c != "" && snap.HiddenModels[c] {
 			return false

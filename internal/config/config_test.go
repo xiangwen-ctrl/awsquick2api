@@ -485,3 +485,39 @@ func TestAdminKeyValidationTrimAndInflightPayloadFloor(t *testing.T) {
 		t.Fatalf("MaxInflightPayloadBytes = %d, want %d", next.Server.MaxInflightPayloadBytes, 8<<20)
 	}
 }
+
+func TestCORSAllowedOriginsConfigAndEnvOverride(t *testing.T) {
+	clearEnv(t)
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"server":{"cors_allowed_origins":[" https://chat.example.com/ ","HTTPS://CHAT.EXAMPLE.COM","","http://localhost:3000/"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"https://chat.example.com", "http://localhost:3000"}
+	if !slices.Equal(cfg.Server.CORSAllowedOrigins, want) {
+		t.Fatalf("CORSAllowedOrigins = %v, want %v", cfg.Server.CORSAllowedOrigins, want)
+	}
+	snap := SnapshotFromConfig(cfg)
+	if !slices.Equal(snap.CORSAllowedOrigins, want) {
+		t.Fatalf("Snapshot.CORSAllowedOrigins = %v, want %v", snap.CORSAllowedOrigins, want)
+	}
+
+	t.Setenv("AWSQUICK_CORS_ORIGINS", " https://a.example.com/ , * , https://a.example.com ")
+	cfgEnv, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantEnv := []string{"https://a.example.com", "*"}
+	if !slices.Equal(cfgEnv.Server.CORSAllowedOrigins, wantEnv) {
+		t.Fatalf("env CORSAllowedOrigins = %v, want %v", cfgEnv.Server.CORSAllowedOrigins, wantEnv)
+	}
+	if !slices.Contains(ActiveEnvOverrides(), "AWSQUICK_CORS_ORIGINS") {
+		t.Fatalf("AWSQUICK_CORS_ORIGINS missing from ActiveEnvOverrides: %v", ActiveEnvOverrides())
+	}
+	if restart := DiffRestartFields(cfg, cfgEnv); len(restart) != 0 {
+		t.Fatalf("cors_allowed_origins change must not require restart, got %v", restart)
+	}
+}

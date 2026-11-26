@@ -37,15 +37,21 @@ func VerifyBearer(r *http.Request, want string) bool {
 	return got != "" && Equal(got, want)
 }
 
+// ExtractAnthropic extracts x-api-key first, falling back to Authorization: Bearer.
+func ExtractAnthropic(r *http.Request) string {
+	if k := strings.TrimSpace(r.Header.Get("x-api-key")); k != "" {
+		return k
+	}
+	return ExtractBearer(r)
+}
+
 // VerifyAnthropic checks x-api-key first, then Authorization: Bearer.
 func VerifyAnthropic(r *http.Request, want string) bool {
 	if want == "" {
 		return false
 	}
-	if k := strings.TrimSpace(r.Header.Get("x-api-key")); k != "" {
-		return Equal(k, want)
-	}
-	return VerifyBearer(r, want)
+	got := ExtractAnthropic(r)
+	return got != "" && Equal(got, want)
 }
 
 // VerifyDual accepts either Authorization: Bearer or x-api-key (for /v1/models).
