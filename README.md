@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/xiangwen-ctrl/awsquick2api/actions/workflows/ci.yml/badge.svg)](https://github.com/xiangwen-ctrl/awsquick2api/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/xiangwen-ctrl/awsquick2api)](https://github.com/xiangwen-ctrl/awsquick2api/releases)
-[![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](./go.mod)
+[![Go](https://img.shields.io/badge/Go-1.26.11%2B-00ADD8?logo=go&logoColor=white)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
 AWSQuick2API 是一个纯 Go 编写的自托管网关，可将 Amazon Quick 账号封装为标准的 OpenAI、Anthropic（Claude Code）与 Codex Responses 兼容 API，并内置单页 Web 管理面板。
@@ -23,13 +23,23 @@ AWSQuick2API 是一个纯 Go 编写的自托管网关，可将 Amazon Quick 账�
 从 [GitHub Releases](https://github.com/xiangwen-ctrl/awsquick2api/releases) 下载对应平台的可执行文件：
 
 - **Windows**：双击 `awsquick2api-windows-amd64.exe` 启动（后台常驻并显示系统托盘图标，首次启动会自动打开管理面板）。
-- **Linux / macOS**：
+- **Linux x86-64**：
   ```bash
   chmod +x awsquick2api-linux-amd64
   ./awsquick2api-linux-amd64
   ```
+- **macOS Apple Silicon**：
+  ```bash
+  chmod +x awsquick2api-darwin-arm64
+  ./awsquick2api-darwin-arm64
+  ```
+  Intel Mac 使用 `awsquick2api-darwin-amd64`，Linux ARM64 使用 `awsquick2api-linux-arm64`。
 
 首次运行会在同目录生成 `config.json`（包含随机生成的 `api_key` 和 `admin_key`）及 `data/encryption.key`。
+
+### 从旧版升级
+
+停止网关后，备份可执行文件、`config.json`、`auths/` 和 `data/`。替换可执行文件并启动，继续使用原有的 `api_key` 和账号。新版会生成缺失的 `admin_key`，并将识别到的旧明文账号迁入加密存储。跨机器迁移账号时可使用面板或命令行导出的加密迁移包。
 
 ### 2. 登录面板并添加账号
 
@@ -51,13 +61,13 @@ AWSQuick2API 是一个纯 Go 编写的自托管网关，可将 Amazon Quick 账�
 **Claude Code**
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8045"
-export ANTHROPIC_API_KEY="你的 api_key"
+export ANTHROPIC_AUTH_TOKEN="你的 api_key"
 claude
 ```
 ```powershell
 # Windows PowerShell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8045"
-$env:ANTHROPIC_API_KEY  = "你的 api_key"
+$env:ANTHROPIC_AUTH_TOKEN = "你的 api_key"
 claude
 ```
 
@@ -72,7 +82,7 @@ base_url = "http://127.0.0.1:8045/v1"
 env_key = "AWSQUICK_API_KEY"
 wire_api = "responses"
 ```
-启动前设置环境变量 `AWSQUICK_API_KEY="你的 api_key"`。
+启动前设置环境变量 `AWSQUICK_API_KEY="你的 api_key"`。Responses 支持 HTTP POST 和 SSE。续聊须在 `input` 中携带完整历史，`previous_response_id` 会返回错误。WebSocket 请求会收到使用 HTTP POST 的提示。Codex 的 MCP 工具支持按命名空间记录和续传。
 
 ## API 端点与模型
 
@@ -98,9 +108,13 @@ wire_api = "responses"
 
 > `aws-quick/<档位>` 与 `qw/<档位>` 形式的 provider 前缀会被自动剥离，例如 `aws-quick/advanced-high` 等价于 `amazon-advanced-high`。`amazon-advanced` 只会调度到已开通 Advanced 的账号；池中没有此类账号时请求返回 `400`。
 
+三个推理入口均支持输出上限。有上限时，网关等待 Amazon Quick 完成并确认实际用量，再返回输出。超限返回各协议的长度结束状态，正文和工具调用为空，usage 记录实际用量。上游生成和额度消耗仍由 Amazon Quick 决定。图片支持符合大小限制的内联 base64 PNG、JPEG、GIF 和 WebP，需要启用附件并有支持附件的账号。
+
 ## 配置说明
 
-完整配置项参考 [`config.example.json`](./config.example.json)，面板保存后大部分配置即时生效；`listen`、`auth_dir`、`data_dir` 与 `server.read_timeout_seconds` / `shutdown_timeout_seconds` / `max_payload_bytes` 修改后需重启（面板会提示 `restart_required`），`server.trusted_hosts` 支持热生效。若 `admin_key` 为空，首次启动会生成一次并写回 `config.json`，之后重启保持不变。Linux 服务器 `systemd` 部署及无头登录见 [`docs/LINUX.md`](./docs/LINUX.md)。
+完整配置项见 [示例配置](./config.example.json)。面板保存后大部分设置即时生效，包括 `server.trusted_hosts`。修改 `listen`、`auth_dir`、`data_dir` 或服务器的读取超时、退出超时、请求体上限和并发请求体预算时，面板会列出需重启的配置项。Linux 部署及无头登录见 [Linux 部署说明](./docs/LINUX.md)。
+
+使用示例配置时，请先填写自定义 `api_key` 或设置 `AWSQUICK_API_KEY`。空值和示例占位值会导致启动或保存失败。
 
 常用配置项补充：
 
@@ -108,8 +122,13 @@ wire_api = "responses"
 | --- | --- | --- |
 | `features.strict_privacy_dlp` | `true` | 严格隐私脱敏：在流式回复与工具调用参数中屏蔽账号邮箱、姓名、ID 及其编码 / 拆字 / 倒序变体（如 `[at]`/`(at)` 混淆邮箱），防止共享 `api_key` 时泄露账号身份。可在面板「模型与接入」页切换；关闭后仅保留基础脱敏。 |
 | `upstream.max_frame_bytes` | `63000` | 单帧上限（字节），用于消息压缩拟合与超限重试。`0` 或负数会被纠正为默认值，最小 `8192`。 |
+| `upstream.single_client_thread_reuse` | `false` | 单一可信调用方的专用实例可显式开启。客户端需传 `X-Aws-Quick-Conversation`，并回传一致的对话历史。升级时旧 `upstream.stateful` 字段不启用复用。 |
+| `server.max_payload_bytes` | 24 MiB | 单请求上限，同时受并发请求体预算约束。 |
+| `server.max_inflight_payload_bytes` | 32 MiB | 推理和 token 估算请求共用的请求体预算，适用于读取、解析及请求处理期间。每个请求至少预留 1 MiB，未知长度按单请求上限预留。 |
 | `server.shutdown_timeout_seconds` | `30` | 优雅退出时等待进行中请求（含流式对话）结束的最长时间，超时后才强制中断。 |
 | `server.trusted_hosts` | `[]` | 本机回环监听并配合 Nginx/Caddy TLS 反代访问面板时，额外放行的 `Host` 域名白名单（防 DNS 重绑定；支持热生效）。 |
+
+升级时，已保存的单请求上限仍参与计算。实际限制取单请求上限和并发请求体预算中的较小值。
 
 ### 命令行参数
 
@@ -165,21 +184,29 @@ sudo systemctl daemon-reload && sudo systemctl enable --now awsquick2api
 
 ## 从源码构建
 
-需要 Go 1.26+：
+需要 Go 1.26.11+：
 
 ```bash
-# Linux / macOS（-X 注入版本号，显示在启动日志与面板中）
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.appVersion=$(git describe --tags --always)" -o awsquick2api ./cmd/awsquick2api
+# Linux / macOS
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o awsquick2api ./cmd/awsquick2api
 
 # Linux amd64 + arm64 交叉编译（自动注入 git describe 版本）
 ./scripts/build-linux.sh        # 或 Windows 上：./scripts/build-linux.ps1
 
-# Windows（系统托盘版）
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H=windowsgui -X main.appVersion=0.1.2" -o awsquick2api.exe ./cmd/awsquick2api
-
 # 运行测试
 CGO_ENABLED=0 go test ./...
 ```
+
+Windows 系统托盘版可从 PowerShell 构建。
+
+```powershell
+$env:CGO_ENABLED = "0"
+go build -trimpath -ldflags="-s -w -H=windowsgui" -o awsquick2api.exe ./cmd/awsquick2api
+```
+
+## 版本说明更正
+
+v0.1.2 的说明应为“13 个包的测试全部通过”。各包的 Go 语句覆盖率以 `go test -cover ./...` 的结果为准。
 
 ## 注意事项与许可
 

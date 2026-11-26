@@ -290,6 +290,9 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	closeOpenBlock()
 
 	stopReason := "end_turn"
+	if out.Result.OutputLimitReached {
+		stopReason = "max_tokens"
+	}
 	if len(out.Result.ToolCalls) > 0 {
 		stopReason = "tool_use"
 		for _, tc := range out.Result.ToolCalls {
@@ -354,6 +357,9 @@ func writeAnthropicNonStream(w http.ResponseWriter, msgID, model string, res ups
 		})
 	}
 	stopReason := "end_turn"
+	if res.OutputLimitReached {
+		stopReason = "max_tokens"
+	}
 	if len(res.ToolCalls) > 0 {
 		stopReason = "tool_use"
 		for _, tc := range res.ToolCalls {
@@ -608,7 +614,12 @@ func anthropicToChatRequest(body map[string]any, headers http.Header) (upstream.
 		}
 	}
 
+	maxOutput, err := outputTokenLimit(body, "max_tokens")
+	if err != nil {
+		return upstream.ChatRequest{}, err
+	}
 	return upstream.ChatRequest{
+		MaxOutputTokens:   maxOutput,
 		Model:             reqModel,
 		ThinkingEffort:    effort,
 		Messages:          msgs,
@@ -641,7 +652,7 @@ func flattenAnthropicText(raw any) string {
 func convertAnthropicImageBlock(bm map[string]any) map[string]any {
 	src, ok := bm["source"].(map[string]any)
 	if !ok {
-		return nil
+		return map[string]any{"type": "image_url"}
 	}
 	if src["type"] == "base64" {
 		mt, _ := src["media_type"].(string)
@@ -665,7 +676,7 @@ func convertAnthropicImageBlock(bm map[string]any) map[string]any {
 			}
 		}
 	}
-	return nil
+	return map[string]any{"type": "image_url"}
 }
 
 func convertAnthropicToolResultContent(raw any) any {

@@ -33,7 +33,7 @@ import (
 	"awsquick2api/internal/upstream"
 )
 
-var appVersion = "0.1.2"
+var appVersion = "0.1.3"
 
 func formatStartupErrorDialog(err error, logFileHint string) string {
 	msg := fmt.Sprintf("启动失败：%s", reqlog.ScrubCredentials(err.Error()))
@@ -122,6 +122,9 @@ func run(showGUIError *bool, logFileHint *string, closeLog *func()) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	if !config.ValidAPIKey(cfg.APIKey) {
+		return fmt.Errorf("set a valid api_key in config or AWSQUICK_API_KEY")
+	}
 	anchorRelativePaths(cfg, cfgDir)
 
 	if err := os.MkdirAll(cfg.AuthDir, 0o700); err != nil {
@@ -207,19 +210,10 @@ func run(showGUIError *bool, logFileHint *string, closeLog *func()) error {
 			return up.HTTPClient(30 * time.Second)
 		},
 		func(acct *auth.Account) error {
-			// Preserve existing custom name & device ID if re-logging into same UID.
-			if existing := p.AuthByUID(acct.UID); existing != nil {
-				if acct.CustomName == "" {
-					acct.CustomName = existing.CustomName
-				}
-				if auth.IsDeviceID(existing.DeviceID) {
-					acct.DeviceID = existing.DeviceID
-				}
-			}
-			if err := auth.SaveAccount(cfg.AuthDir, vault, acct); err != nil {
+			store := pool.CredentialStore{Pool: p, Dir: cfg.AuthDir, Vault: vault}
+			if _, err := store.Put(acct, true, true); err != nil {
 				return err
 			}
-			p.AddOrUpdate(acct)
 			log.Printf("[auth] added/updated account uid=%s provider=%s", acct.UID, acct.Provider)
 			go func(uid string) {
 				qctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -313,16 +307,17 @@ func run(showGUIError *bool, logFileHint *string, closeLog *func()) error {
 	})
 
 	gw := server.NewHandler(server.Config{
-		Pool:            p,
-		Upstream:        up,
-		Scheduler:       sch,
-		Session:         sess,
-		Live:            live,
-		ReqLog:          rec,
-		Panel:           pn,
-		MaxPayloadBytes: cfg.Server.MaxPayloadBytes,
-		MaxRotate:       cfg.Pool.MaxRotate,
-		Version:         appVersion,
+		Pool:                    p,
+		Upstream:                up,
+		Scheduler:               sch,
+		Session:                 sess,
+		Live:                    live,
+		ReqLog:                  rec,
+		Panel:                   pn,
+		MaxPayloadBytes:         cfg.Server.MaxPayloadBytes,
+		MaxInflightPayloadBytes: cfg.Server.MaxInflightPayloadBytes,
+		MaxRotate:               cfg.Pool.MaxRotate,
+		Version:                 appVersion,
 	})
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

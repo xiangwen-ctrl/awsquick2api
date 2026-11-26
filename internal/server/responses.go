@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 	"sync"
@@ -33,7 +34,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	reqModel, _ := body["model"].(string)
 	streamFlag, _ := body["stream"].(bool)
 
-	upReq, customTools, err := responsesToChatRequest(body, r.Header)
+	upReq, toolSpecs, err := responsesToChatRequest(body, r.Header)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -52,7 +53,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setGatewayResponseHeaders(w, out.ReqID, out.Account, out.Result.Usage.ResolvedModel, out.Result.ThreadReused)
-		writeJSON(w, http.StatusOK, buildResponsesObject(respID, created, reqModel, "completed", out.Result, customTools, nil))
+		writeJSON(w, http.StatusOK, buildResponsesObject(respID, created, reqModel, "completed", out.Result, toolSpecs, nil))
 		return
 	}
 
@@ -60,7 +61,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	var (
 		writeMu      sync.Mutex
 		keepalive    *sseKeepalive
-		itemIDs      responseItemIDs
+		output       = make([]map[string]any, 0)
 		started      bool
 		seq          int
 		outIdx       int
@@ -71,6 +72,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		msgItemID    string
 		msgIdx       int
 		textAcc      strings.Builder
+		streamedText strings.Builder
 		reasoningAcc strings.Builder
 	)
 	defer func() { keepalive.Stop() }()
@@ -78,6 +80,9 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	sendEvent := func(eventName string, payload map[string]any) {
 		writeMu.Lock()
 		defer writeMu.Unlock()
+		if eventName == "response.output_item.done" {
+			output = append(output, payload["item"].(map[string]any))
+		}
 		payload["type"] = eventName
 		payload["sequence_number"] = seq
 		seq++
@@ -97,6 +102,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		rsnOpened = false
 		full := reasoningAcc.String()
+		reasoningAcc.Reset()
 		sendEvent("response.reasoning_summary_text.done", map[string]any{
 			"item_id":       rsnItemID,
 			"output_index":  rsnIdx,
@@ -126,6 +132,8 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		msgOpened = false
 		full := textAcc.String()
+		textAcc.Reset()
+		streamedText.WriteString(full)
 		sendEvent("response.output_text.done", map[string]any{
 			"item_id":       msgItemID,
 			"output_index":  msgIdx,
@@ -194,14 +202,12 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	onEvent := func(ev upstream.ChatEvent) {
 		switch ev.Type {
 		case "reasoning":
+			closeMessage()
 			if !rsnOpened {
 				rsnOpened = true
 				rsnIdx = outIdx
 				outIdx++
 				rsnItemID = "rs_" + strings.ReplaceAll(auth.NewUUID(), "-", "")
-				if itemIDs.Reasoning == "" {
-					itemIDs.Reasoning = rsnItemID
-				}
 				sendEvent("response.output_item.added", map[string]any{
 					"output_index": rsnIdx,
 					"item": map[string]any{
@@ -235,9 +241,6 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 				msgIdx = outIdx
 				outIdx++
 				msgItemID = "msg_" + strings.ReplaceAll(auth.NewUUID(), "-", "")
-				if itemIDs.Message == "" {
-					itemIDs.Message = msgItemID
-				}
 				sendEvent("response.output_item.added", map[string]any{
 					"output_index": msgIdx,
 					"item": map[string]any{
@@ -304,108 +307,65 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	for _, tc := range out.Result.ToolCalls {
 		idx := outIdx
 		outIdx++
-		itemID := "fc_" + strings.ReplaceAll(auth.NewUUID(), "-", "")
-		itemIDs.Calls = append(itemIDs.Calls, itemID)
-		if customTools[tc.Name] {
-			inputStr := extractCustomToolInput(tc.Arguments)
-			item := map[string]any{
-				"id":      itemID,
-				"type":    "custom_tool_call",
-				"status":  "completed",
-				"call_id": tc.ID,
-				"name":    tc.Name,
-				"input":   inputStr,
-			}
-			sendEvent("response.output_item.added", map[string]any{
-				"output_index": idx,
-				"item":         map[string]any{"id": itemID, "type": "custom_tool_call", "status": "in_progress", "call_id": tc.ID, "name": tc.Name, "input": ""},
-			})
-			sendEvent("response.custom_tool_call_input.delta", map[string]any{
-				"item_id":      itemID,
-				"output_index": idx,
-				"delta":        inputStr,
-			})
-			sendEvent("response.custom_tool_call_input.done", map[string]any{
-				"item_id":      itemID,
-				"output_index": idx,
-				"input":        inputStr,
-			})
-			sendEvent("response.output_item.done", map[string]any{
-				"output_index": idx,
-				"item":         item,
-			})
-			continue
+		item := responsesToolItem(tc, toolSpecs[tc.Name])
+		itemID := item["id"]
+		eventPrefix, valueField := "response.function_call_arguments", "arguments"
+		if item["type"] == "custom_tool_call" {
+			eventPrefix, valueField = "response.custom_tool_call_input", "input"
 		}
-
-		args := strings.TrimSpace(tc.Arguments)
-		if args == "" {
-			args = "{}"
-		}
-		sendEvent("response.output_item.added", map[string]any{
-			"output_index": idx,
-			"item": map[string]any{
-				"id":        itemID,
-				"type":      "function_call",
-				"status":    "in_progress",
-				"call_id":   tc.ID,
-				"name":      tc.Name,
-				"arguments": "",
-			},
-		})
-		sendEvent("response.function_call_arguments.delta", map[string]any{
-			"item_id":      itemID,
-			"output_index": idx,
-			"delta":        args,
-		})
-		sendEvent("response.function_call_arguments.done", map[string]any{
-			"item_id":      itemID,
-			"output_index": idx,
-			"arguments":    args,
-		})
-		sendEvent("response.output_item.done", map[string]any{
-			"output_index": idx,
-			"item": map[string]any{
-				"id":        itemID,
-				"type":      "function_call",
-				"status":    "completed",
-				"call_id":   tc.ID,
-				"name":      tc.Name,
-				"arguments": args,
-			},
-		})
+		startedItem := maps.Clone(item)
+		startedItem["status"], startedItem[valueField] = "in_progress", ""
+		sendEvent("response.output_item.added", map[string]any{"output_index": idx, "item": startedItem})
+		sendEvent(eventPrefix+".delta", map[string]any{"item_id": itemID, "output_index": idx, "delta": item[valueField]})
+		sendEvent(eventPrefix+".done", map[string]any{"item_id": itemID, "output_index": idx, valueField: item[valueField]})
+		sendEvent("response.output_item.done", map[string]any{"output_index": idx, "item": item})
 	}
 
-	sendEvent("response.completed", map[string]any{
-		"response": buildResponsesObject(respID, created, reqModel, "completed", out.Result, customTools, &itemIDs),
+	status := "completed"
+	if out.Result.OutputLimitReached {
+		status = "incomplete"
+	}
+	result := out.Result
+	result.Text = streamedText.String()
+	sendEvent("response."+status, map[string]any{
+		"response": buildResponsesObject(respID, created, reqModel, status, result, toolSpecs, output),
 	})
-}
-
-// responseItemIDs carries the output item IDs already announced on the SSE stream so
-// that response.completed reports the same IDs instead of minting fresh ones.
-type responseItemIDs struct {
-	Reasoning string
-	Message   string
-	Calls     []string
 }
 
 func newItemID(prefix string) string {
 	return prefix + strings.ReplaceAll(auth.NewUUID(), "-", "")
 }
 
-func buildResponsesObject(respID string, created int64, model, status string, res upstream.ChatResult, customTools map[string]bool, ids *responseItemIDs) map[string]any {
-	if ids == nil {
-		ids = &responseItemIDs{}
+func buildResponsesObject(respID string, created int64, model, status string, res upstream.ChatResult, toolSpecs map[string]responseToolSpec, output []map[string]any) map[string]any {
+	if output == nil {
+		output = responsesOutput(res, toolSpecs)
 	}
-	pick := func(existing, prefix string) string {
-		if existing != "" {
-			return existing
-		}
-		return newItemID(prefix)
+	details := any(nil)
+	if res.OutputLimitReached {
+		status = "incomplete"
+		details = map[string]any{"reason": "max_output_tokens"}
 	}
+	total := res.Usage.TotalTokens
+	if total == 0 {
+		total = res.Usage.PromptTokens + res.Usage.CompletionTokens
+	}
+	usage := map[string]any{
+		"input_tokens": res.Usage.PromptTokens, "output_tokens": res.Usage.CompletionTokens, "total_tokens": total,
+	}
+	if res.Usage.CacheReadTokens > 0 {
+		usage["input_tokens_details"] = map[string]any{"cached_tokens": res.Usage.CacheReadTokens}
+	}
+	return map[string]any{
+		"id": respID, "object": "response", "created_at": created, "status": status,
+		"model": model, "output": output, "output_text": res.Text, "usage": usage, "incomplete_details": details,
+	}
+}
+
+func responsesOutput(res upstream.ChatResult, toolSpecs map[string]responseToolSpec) []map[string]any {
 	output := make([]map[string]any, 0, 2+len(res.ToolCalls))
 	if res.Reasoning != "" {
 		output = append(output, map[string]any{
-			"id":      pick(ids.Reasoning, "rs_"),
+			"id":      newItemID("rs_"),
 			"type":    "reasoning",
 			"status":  "completed",
 			"summary": []map[string]any{{"type": "summary_text", "text": res.Reasoning}},
@@ -413,7 +373,7 @@ func buildResponsesObject(respID string, created int64, model, status string, re
 	}
 	if strings.TrimSpace(res.Text) != "" {
 		output = append(output, map[string]any{
-			"id":     pick(ids.Message, "msg_"),
+			"id":     newItemID("msg_"),
 			"type":   "message",
 			"status": "completed",
 			"role":   "assistant",
@@ -426,58 +386,10 @@ func buildResponsesObject(respID string, created int64, model, status string, re
 			},
 		})
 	}
-	for i, tc := range res.ToolCalls {
-		callItemID := ""
-		if i < len(ids.Calls) {
-			callItemID = ids.Calls[i]
-		}
-		callItemID = pick(callItemID, "fc_")
-		if customTools[tc.Name] {
-			output = append(output, map[string]any{
-				"id":      callItemID,
-				"type":    "custom_tool_call",
-				"status":  "completed",
-				"call_id": tc.ID,
-				"name":    tc.Name,
-				"input":   extractCustomToolInput(tc.Arguments),
-			})
-		} else {
-			args := strings.TrimSpace(tc.Arguments)
-			if args == "" {
-				args = "{}"
-			}
-			output = append(output, map[string]any{
-				"id":        callItemID,
-				"type":      "function_call",
-				"status":    "completed",
-				"call_id":   tc.ID,
-				"name":      tc.Name,
-				"arguments": args,
-			})
-		}
+	for _, tc := range res.ToolCalls {
+		output = append(output, responsesToolItem(tc, toolSpecs[tc.Name]))
 	}
-	total := res.Usage.TotalTokens
-	if total == 0 {
-		total = res.Usage.PromptTokens + res.Usage.CompletionTokens
-	}
-	usageMap := map[string]any{
-		"input_tokens":  res.Usage.PromptTokens,
-		"output_tokens": res.Usage.CompletionTokens,
-		"total_tokens":  total,
-	}
-	if res.Usage.CacheReadTokens > 0 {
-		usageMap["input_tokens_details"] = map[string]any{"cached_tokens": res.Usage.CacheReadTokens}
-	}
-	return map[string]any{
-		"id":          respID,
-		"object":      "response",
-		"created_at":  created,
-		"status":      status,
-		"model":       model,
-		"output":      output,
-		"output_text": res.Text,
-		"usage":       usageMap,
-	}
+	return output
 }
 
 func extractCustomToolInput(argsJSON string) string {
@@ -553,7 +465,7 @@ func responsesTextFormat(body map[string]any) any {
 	}
 }
 
-func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.ChatRequest, map[string]bool, error) {
+func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.ChatRequest, map[string]responseToolSpec, error) {
 	reqModel, _ := body["model"].(string)
 	var msgs []map[string]any
 
@@ -592,7 +504,7 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 				if callID == "" {
 					callID, _ = item["id"].(string)
 				}
-				name, _ := item["name"].(string)
+				name := responsesToolName(item)
 				msgs = appendAssistantToolCall(msgs, map[string]any{
 					"id":   callID,
 					"type": "function",
@@ -606,7 +518,7 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 				if callID == "" {
 					callID, _ = item["id"].(string)
 				}
-				name, _ := item["name"].(string)
+				name := responsesToolName(item)
 				argsJSON, _ := json.Marshal(map[string]any{"input": customToolInputString(item["input"])})
 				msgs = appendAssistantToolCall(msgs, map[string]any{
 					"id":   callID,
@@ -623,6 +535,8 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 					"tool_call_id": callID,
 					"content":      convertResponsesContent(item["output"]),
 				})
+			case "input_image":
+				msgs = append(msgs, map[string]any{"role": "user", "content": convertResponsesContent([]any{item})})
 			case "reasoning":
 				continue
 			case "", "message":
@@ -661,57 +575,9 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 		return upstream.ChatRequest{}, nil, fmt.Errorf("input must not be empty")
 	}
 
-	customTools := map[string]bool{}
-	var oaTools []any
-	if rawTools, ok := body["tools"].([]any); ok {
-		for _, item := range rawTools {
-			tm, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			typ, _ := tm["type"].(string)
-			switch typ {
-			case "function":
-				name, _ := tm["name"].(string)
-				if name == "" {
-					if fn, ok := tm["function"].(map[string]any); ok {
-						name, _ = fn["name"].(string)
-						tm = fn
-					}
-				}
-				if strings.TrimSpace(name) == "" {
-					continue
-				}
-				fn := map[string]any{"name": name}
-				if desc, ok := tm["description"].(string); ok && desc != "" {
-					fn["description"] = desc
-				}
-				if params, ok := tm["parameters"]; ok && params != nil {
-					fn["parameters"] = params
-				}
-				oaTools = append(oaTools, map[string]any{"type": "function", "function": fn})
-			case "custom":
-				name, _ := tm["name"].(string)
-				if strings.TrimSpace(name) == "" {
-					continue
-				}
-				customTools[name] = true
-				fn := map[string]any{
-					"name": name,
-					"parameters": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"input": map[string]any{"type": "string", "description": "Raw input string for this custom tool"},
-						},
-						"required": []string{"input"},
-					},
-				}
-				if desc, ok := tm["description"].(string); ok && desc != "" {
-					fn["description"] = desc
-				}
-				oaTools = append(oaTools, map[string]any{"type": "function", "function": fn})
-			}
-		}
+	oaTools, toolSpecs, err := responsesToolDefinitions(body["tools"])
+	if err != nil {
+		return upstream.ChatRequest{}, nil, err
 	}
 
 	var toolChoice any
@@ -720,7 +586,7 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 		case string:
 			toolChoice = tc
 		case map[string]any:
-			if name, _ := tc["name"].(string); name != "" {
+			if name := responsesToolName(tc); name != "" {
 				toolChoice = map[string]any{"type": "function", "function": map[string]any{"name": name}}
 			} else if fn, ok := tc["function"].(map[string]any); ok {
 				toolChoice = map[string]any{"type": "function", "function": fn}
@@ -744,7 +610,12 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 		}
 	}
 
+	maxOutput, err := outputTokenLimit(body, "max_output_tokens")
+	if err != nil {
+		return upstream.ChatRequest{}, nil, err
+	}
 	return upstream.ChatRequest{
+		MaxOutputTokens:   maxOutput,
 		Model:             reqModel,
 		ThinkingEffort:    effort,
 		Messages:          msgs,
@@ -753,7 +624,7 @@ func responsesToChatRequest(body map[string]any, headers http.Header) (upstream.
 		ParallelToolCalls: parallelPtr,
 		ResponseFormat:    responsesTextFormat(body),
 		ConversationID:    convID,
-	}, customTools, nil
+	}, toolSpecs, nil
 }
 
 func convertResponsesContent(raw any) any {
@@ -782,12 +653,7 @@ func convertResponsesContent(raw any) any {
 				case map[string]any:
 					u, _ = iu["url"].(string)
 				}
-				if u != "" {
-					out = append(out, map[string]any{
-						"type":      "image_url",
-						"image_url": map[string]any{"url": u},
-					})
-				}
+				out = append(out, map[string]any{"type": "image_url", "image_url": map[string]any{"url": u}})
 			default:
 				if t, ok := pm["text"].(string); ok {
 					out = append(out, map[string]any{"type": "text", "text": t})

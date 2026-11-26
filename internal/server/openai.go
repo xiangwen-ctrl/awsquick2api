@@ -127,7 +127,13 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	maxOutput, err := outputTokenLimit(body, "max_completion_tokens", "max_tokens")
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 	upReq := upstream.ChatRequest{
+		MaxOutputTokens:   maxOutput,
 		Model:             reqModel,
 		ThinkingEffort:    reqEffort,
 		Messages:          msgs,
@@ -259,6 +265,9 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	finishReason := "stop"
+	if out.Result.OutputLimitReached {
+		finishReason = "length"
+	}
 	if len(out.Result.ToolCalls) > 0 {
 		if legacyFunctions {
 			tc := out.Result.ToolCalls[0]
@@ -321,6 +330,10 @@ func writeOpenAINonStreamResponse(w http.ResponseWriter, id string, created int6
 		msg["reasoning_content"] = res.Reasoning
 	}
 	finishReason := "stop"
+	if res.OutputLimitReached {
+		finishReason = "length"
+		msg["content"] = ""
+	}
 	if len(res.ToolCalls) > 0 {
 		if legacyFunctions {
 			tc := res.ToolCalls[0]

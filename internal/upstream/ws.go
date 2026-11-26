@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,12 +45,13 @@ var (
 
 // Usage holds token counts reported by Amazon Quick's turn_usage events.
 type Usage struct {
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
-	CacheReadTokens  int
-	CacheWriteTokens int
-	ResolvedModel    string
+	PromptTokens      int
+	CompletionTokens  int
+	OutputTokensKnown bool
+	TotalTokens       int
+	CacheReadTokens   int
+	CacheWriteTokens  int
+	ResolvedModel     string
 }
 
 // ChatEvent is a single streamed event emitted during an upstream chat turn.
@@ -59,12 +62,13 @@ type ChatEvent struct {
 
 // ChatResult is the complete outcome of one Amazon Quick chat turn.
 type ChatResult struct {
-	Text         string
-	Reasoning    string
-	ToolCalls    []ToolCall
-	Usage        Usage
-	ThreadReused bool
-	ThreadID     string
+	Text               string
+	Reasoning          string
+	ToolCalls          []ToolCall
+	OutputLimitReached bool
+	Usage              Usage
+	ThreadReused       bool
+	ThreadID           string
 }
 
 type wsSession struct {
@@ -559,16 +563,17 @@ func (c *Client) executeWSTurn(
 	}()
 
 	var (
-		textBuf     strings.Builder
-		thoughtBuf  strings.Builder
-		usage       Usage
-		chunks      = map[string]*chunkAssembly{}
-		chunkBytes  int
-		seenTools   = map[string]bool{}
-		decoder     = NewWireDecoder(sess.Gateway)
-		idleDur     = time.Duration(cfg.IdleTimeoutSeconds) * time.Second
-		completeAt  time.Time
-		hasComplete bool
+		textBuf            strings.Builder
+		thoughtBuf         strings.Builder
+		usage              Usage
+		chunks             = map[string]*chunkAssembly{}
+		chunkBytes         int
+		seenTools          = map[string]bool{}
+		decoder            = NewWireDecoder(sess.Gateway)
+		idleDur            = time.Duration(cfg.IdleTimeoutSeconds) * time.Second
+		completeAt         time.Time
+		hasComplete        bool
+		invalidOutputUsage bool
 	)
 	if idleDur <= 0 {
 		idleDur = 2 * time.Minute
@@ -694,7 +699,21 @@ func (c *Client) executeWSTurn(
 				usage.CacheReadTokens = cacheRead
 				usage.CacheWriteTokens = cacheWrite
 			}
-			usage.CompletionTokens += int(asFloat(p["output_tokens"]))
+			if raw, reported := p["output_tokens"]; reported {
+				n, ok := raw.(float64)
+				if encoded, isString := raw.(string); isString {
+					var err error
+					n, err = strconv.ParseFloat(strings.TrimSpace(encoded), 64)
+					ok = err == nil
+				}
+				if ok && n >= 0 && n <= float64(math.MaxInt32-usage.CompletionTokens) && n == math.Trunc(n) {
+					usage.CompletionTokens += int(n)
+					usage.OutputTokensKnown = !invalidOutputUsage
+				} else {
+					invalidOutputUsage = true
+					usage.OutputTokensKnown = false
+				}
+			}
 			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 			if rm, ok := p["resolved_model_id"].(string); ok && strings.TrimSpace(rm) != "" {
 				usage.ResolvedModel = strings.TrimSpace(rm)
@@ -751,6 +770,9 @@ func (c *Client) executeWSTurn(
 				writeMu.Lock()
 				live = false
 				writeMu.Unlock()
+				if !hasComplete {
+					return false, (&UpstreamError{Kind: ErrKindTransport, Code: "upstream_incomplete_response", Message: "Amazon Quick ended the turn before completing the message"}).Normalize()
+				}
 				return true, nil
 			}
 		}

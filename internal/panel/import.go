@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"awsquick2api/internal/auth"
+	"awsquick2api/internal/pool"
 )
 
 func validateImportedEndpoints(a *auth.Account) error {
@@ -69,6 +70,7 @@ func (p *Panel) handleAccountsImport(w http.ResponseWriter, r *http.Request) {
 	skipped := 0
 	var errs []string
 	var importedUIDs []string
+	store := pool.CredentialStore{Pool: p.cfg.Pool, Dir: p.cfg.AuthDir, Vault: p.cfg.Vault}
 	for _, a := range parsed {
 		if a == nil || (strings.TrimSpace(a.AccessToken) == "" && strings.TrimSpace(a.RefreshToken) == "") {
 			errs = append(errs, "跳过缺少 token 的记录")
@@ -91,20 +93,15 @@ func (p *Panel) handleAccountsImport(w http.ResponseWriter, r *http.Request) {
 			}
 			a.UID = auth.MakeUID(a.Provider, ident)
 		}
-		if !auth.IsDeviceID(a.DeviceID) {
-			a.DeviceID = auth.NewUUID()
+		saved, err := store.Put(a, req.Overwrite, false)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", a.UID, err))
+			continue
 		}
-		if !req.Overwrite && p.cfg.Pool.AuthByUID(a.UID) != nil {
+		if !saved {
 			skipped++
 			continue
 		}
-		if p.cfg.AuthDir != "" {
-			if err := auth.SaveAccount(p.cfg.AuthDir, p.cfg.Vault, a); err != nil {
-				errs = append(errs, fmt.Sprintf("%s: %v", a.UID, err))
-				continue
-			}
-		}
-		p.cfg.Pool.AddOrUpdate(a)
 		imported++
 		importedUIDs = append(importedUIDs, a.UID)
 	}

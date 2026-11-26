@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/semaphore"
+
 	"awsquick2api/internal/auth"
 	"awsquick2api/internal/config"
 	"awsquick2api/internal/httpauth"
@@ -31,30 +33,36 @@ const ServiceName = "awsquick2api"
 
 // Config wires dependencies into the HTTP gateway Handler.
 type Config struct {
-	Pool             *pool.Pool
-	Upstream         *upstream.Client
-	Scheduler        *scheduler.Scheduler
-	Session          *session.Router
-	Live             *config.LiveHolder
-	ReqLog           *reqlog.Recorder
-	Panel            http.Handler
-	MaxPayloadBytes  int64
-	MaxRotate        int
-	QueueWaitTimeout time.Duration
-	MaxQueue         int
-	Version          string
+	Pool                    *pool.Pool
+	Upstream                *upstream.Client
+	Scheduler               *scheduler.Scheduler
+	Session                 *session.Router
+	Live                    *config.LiveHolder
+	ReqLog                  *reqlog.Recorder
+	Panel                   http.Handler
+	MaxPayloadBytes         int64
+	MaxInflightPayloadBytes int64
+	MaxRotate               int
+	QueueWaitTimeout        time.Duration
+	MaxQueue                int
+	Version                 string
 }
 
 // Handler is the root HTTP router for awsquick2api.
 type Handler struct {
-	cfg Config
-	mux *http.ServeMux
+	cfg           Config
+	mux           *http.ServeMux
+	payloadBudget *semaphore.Weighted
 }
 
 func NewHandler(cfg Config) *Handler {
 	if cfg.MaxPayloadBytes <= 0 {
-		cfg.MaxPayloadBytes = 64 << 20
+		cfg.MaxPayloadBytes = config.DefaultMaxPayloadBytes
 	}
+	if cfg.MaxInflightPayloadBytes <= 0 {
+		cfg.MaxInflightPayloadBytes = config.DefaultMaxInflightPayloadBytes
+	}
+	cfg.MaxPayloadBytes = min(cfg.MaxPayloadBytes, cfg.MaxInflightPayloadBytes)
 	if cfg.MaxRotate <= 0 {
 		cfg.MaxRotate = 3
 	}
@@ -62,8 +70,9 @@ func NewHandler(cfg Config) *Handler {
 		cfg.Version = "dev"
 	}
 	h := &Handler{
-		cfg: cfg,
-		mux: http.NewServeMux(),
+		cfg:           cfg,
+		mux:           http.NewServeMux(),
+		payloadBudget: semaphore.NewWeighted(cfg.MaxInflightPayloadBytes),
 	}
 
 	// OpenAI Chat Completions & Models
@@ -154,27 +163,64 @@ func (h *Handler) maxQueue() int {
 
 func (h *Handler) withBearerAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.apiKey()) {
-			writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
-			return
-		}
-		next(w, r)
+		h.serveInference(w, r, next, httpauth.VerifyBearer, writeOpenAIError)
 	}
 }
 
 func (h *Handler) withAnthropicAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyAnthropic(r, h.apiKey()) {
-			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
+		h.serveInference(w, r, next, httpauth.VerifyAnthropic, writeAnthropicError)
+	}
+}
+
+type threadSessionContextKey struct{}
+
+func (h *Handler) serveInference(
+	w http.ResponseWriter,
+	r *http.Request,
+	next http.HandlerFunc,
+	verify func(*http.Request, string) bool,
+	writeErr func(http.ResponseWriter, int, string, string),
+) {
+	key := h.apiKey()
+	if !config.ValidAPIKey(key) || !verify(r, key) {
+		writeErr(w, http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
+		return
+	}
+	if r.Method == http.MethodPost {
+		limit := h.cfg.MaxPayloadBytes
+		size := r.ContentLength
+		if size > limit {
+			writeErr(w, http.StatusRequestEntityTooLarge, "invalid_request_error",
+				fmt.Sprintf("Request body exceeds limit (%d bytes)", limit))
 			return
 		}
-		next(w, r)
+		if size < 0 {
+			size = limit
+		}
+		reservation := min(max(size, 1<<20), h.cfg.MaxInflightPayloadBytes)
+		if !h.payloadBudget.TryAcquire(reservation) {
+			writeErr(w, http.StatusTooManyRequests, "rate_limit_error", "Concurrent request payload budget exhausted")
+			return
+		}
+		defer h.payloadBudget.Release(reservation)
+
+		// Only the dedicated conversation header authorizes reuse. Other conversation
+		// identifiers can still be used for choosing an account.
+		id := strings.TrimSpace(r.Header.Get("X-Aws-Quick-Conversation"))
+		if len(id) > 0 && len(id) <= 256 {
+			keyDigest := sha256.Sum256([]byte(key))
+			binding := sha256.Sum256(append(keyDigest[:], id...))
+			r = r.WithContext(context.WithValue(r.Context(), threadSessionContextKey{}, hex.EncodeToString(binding[:])))
+		}
 	}
+	next(w, r)
 }
 
 func (h *Handler) withDualAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyDual(r, h.apiKey()) {
+		key := h.apiKey()
+		if !config.ValidAPIKey(key) || !httpauth.VerifyDual(r, key) {
 			writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
 			return
 		}
@@ -270,10 +316,19 @@ func (h *Handler) runChatTurn(
 	// The advanced tier is only served by accounts whose quota reports AdvancedEnabled;
 	// routing it to ordinary accounts would fail upstream and wrongly penalise them.
 	requireAdvanced := slot == "advanced"
+	requireAttachments, imageErr := req.ValidateImageInputs(snap.Upstream.Attachments)
+	if imageErr != nil {
+		return nil, imageErr
+	}
+	if requireAttachments && !h.cfg.Pool.HasAttachmentAccount(requireAdvanced) {
+		return nil, &upstream.UpstreamError{Kind: upstream.ErrKindInvalid, StatusCode: http.StatusBadRequest,
+			Code: "unsupported_image_input", Message: "No configured account supports image attachments for this model"}
+	}
 	req.Slot = slot
 	req.ThinkingEffort = upstream.ResolveThinkingEffort(snap.Thinking, reqModel, slot, suffixEffort, req.ThinkingEffort)
 	strictDLP := snap.StrictPrivacyDLP
 	req.StrictPrivacyDLP = &strictDLP
+	req.ThreadSession, _ = r.Context().Value(threadSessionContextKey{}).(string)
 	if req.ConversationID == "" {
 		req.ConversationID = upstream.ConversationIDFromHeaders(r.Header)
 	}
@@ -346,11 +401,12 @@ func (h *Handler) runChatTurn(
 			pref = ""
 		}
 		lease, aerr := h.cfg.Pool.AcquireWith(ctx, pool.AcquireOptions{
-			PreferredUID:    pref,
-			Exclude:         excluded,
-			WaitTimeout:     h.queueWaitTimeout(),
-			MaxWaiters:      h.maxQueue(),
-			RequireAdvanced: requireAdvanced,
+			PreferredUID:       pref,
+			Exclude:            excluded,
+			WaitTimeout:        h.queueWaitTimeout(),
+			MaxWaiters:         h.maxQueue(),
+			RequireAdvanced:    requireAdvanced,
+			RequireAttachments: requireAttachments,
 		})
 		if aerr != nil {
 			if ctx.Err() != nil {
@@ -389,10 +445,9 @@ func (h *Handler) runChatTurn(
 
 			// Proactive refresh if access token is within 2 minutes of expiring.
 			if h.cfg.Scheduler != nil && acct.NeedsRefresh(time.Now(), 2*time.Minute) {
-				if rerr := h.cfg.Scheduler.RefreshOneTokenIfStale(ctx, acct.UID, acct.AccessToken); rerr == nil {
-					if fresh := h.cfg.Pool.AuthByUID(acct.UID); fresh != nil {
-						acct = fresh
-					}
+				_ = h.cfg.Scheduler.RefreshOneTokenIfStale(ctx, acct.UID, acct.AccessToken)
+				if fresh := h.cfg.Pool.AuthByUID(acct.UID); fresh != nil {
+					acct = fresh
 				}
 			}
 
@@ -424,7 +479,7 @@ func (h *Handler) runChatTurn(
 					}
 				}
 
-				if req.Stream && onStartStream != nil && snap.Upstream.HeaderWaitSeconds > 0 {
+				if req.Stream && !req.DelayOutput() && onStartStream != nil && snap.Upstream.HeaderWaitSeconds > 0 {
 					// Create the timer and publish waitTimer/timerExited while holding
 					// streamMu: the callback acquires streamMu before reading waitTimer
 					// (via commitStreamLocked), which gives a happens-before edge even
@@ -478,7 +533,7 @@ func (h *Handler) runChatTurn(
 				}
 
 				// Check for empty output (no text and no tool calls) before committing.
-				if cerr == nil && strings.TrimSpace(res.Text) == "" && len(res.ToolCalls) == 0 {
+				if cerr == nil && !res.OutputLimitReached && strings.TrimSpace(res.Text) == "" && len(res.ToolCalls) == 0 {
 					if snap.EmptyRetryEnabled && !wasCommitted && !emptyRetried {
 						emptyRetried = true
 						log.Printf("[server] empty reply from acct=%s slot=%s; retrying once", acct.UID, slot)
@@ -536,12 +591,12 @@ func (h *Handler) runChatTurn(
 				if !wasCommitted && uerr.IsAuthError() && !authRefreshed && h.cfg.Scheduler != nil {
 					authRefreshed = true
 					log.Printf("[server] 401 on acct=%s; attempting token refresh and single retry", acct.UID)
-					if rerr := h.cfg.Scheduler.RefreshOneTokenIfStale(ctx, acct.UID, acct.AccessToken); rerr == nil {
-						if fresh := h.cfg.Pool.AuthByUID(acct.UID); fresh != nil {
-							acct = fresh
-							continue
-						}
-					} else {
+					rerr := h.cfg.Scheduler.RefreshOneTokenIfStale(ctx, acct.UID, acct.AccessToken)
+					if fresh := h.cfg.Pool.AuthByUID(acct.UID); fresh != nil && fresh.AccessToken != acct.AccessToken {
+						acct = fresh
+						continue
+					}
+					if rerr != nil {
 						var se *auth.StepError
 						if errors.As(rerr, &se) && se.Expired {
 							log.Printf("WARN: [server] acct=%s refresh expired; rotating", acct.UID)
@@ -614,12 +669,9 @@ func opaqueAccountID(uid string) string {
 // modelPermitted enforces models.allowed / models.hidden at inference time so that
 // callers cannot bypass the GET /v1/models visibility rules by naming a model directly
 // or sending an unknown model name that falls back to the default slot.
-// An empty requested model always maps to the operator-configured default.
+// The resolved default is subject to the same policy when the client omits the model.
 func modelPermitted(snap config.LiveSnapshot, cat *upstream.ModelCatalog, reqModel, slot string, spec upstream.ModelSpec, suffixEffort string, known bool) bool {
 	key := strings.ToLower(strings.TrimSpace(reqModel))
-	if key == "" {
-		return true
-	}
 	if idx := strings.LastIndexByte(key, '/'); idx >= 0 {
 		key = key[idx+1:]
 	}

@@ -120,6 +120,7 @@ func chatOnce(client *Client, acct *auth.Account, conv string, msgs []map[string
 		Model:          "amazon-smart",
 		Slot:           "smart",
 		ConversationID: conv,
+		ThreadSession:  conv,
 		Stream:         onEvent != nil,
 		Messages:       msgs,
 	}, onEvent)
@@ -140,8 +141,8 @@ func TestWSDisconnectBeforeCompleteIsError(t *testing.T) {
 	if count() != 1 {
 		t.Fatalf("expected exactly 1 upstream attempt, got %d", count())
 	}
-	if m := client.Threads.Match(acct.TenantURL+"|"+acct.UID, "conv-cut", []string{"user:x", "assistant", "user:y"}); m != nil {
-		t.Fatalf("partial turn must not be committed, got %+v", m)
+	if len(client.Threads.threads) != 0 {
+		t.Fatal("partial turn must not be committed")
 	}
 }
 
@@ -209,6 +210,8 @@ func TestChatNoRetryAfterStreamedOutput(t *testing.T) {
 func TestChatRetriesStaleThreadBeforeOutput(t *testing.T) {
 	srv, count := newMockQuick(t, func(n int, conn *websocket.Conn, send func(map[string]any), _ func([]byte)) {
 		switch n {
+		case 1:
+			completeTurn(send, "one")
 		case 2:
 			send(map[string]any{"type": "turn_failed", "payload": map[string]any{"message": "stale thread"}})
 		default:
@@ -301,6 +304,14 @@ func TestMessageKeyDistinguishesImagesAndErrors(t *testing.T) {
 	bad := map[string]any{"role": "tool", "tool_call_id": "c1", "content": "out", "is_error": true}
 	if MessageKey(ok) == MessageKey(bad) {
 		t.Fatal("is_error must be part of the tool message key")
+	}
+}
+
+func TestMessageKeyIncludesAssistantOutput(t *testing.T) {
+	first := MessageKey(map[string]any{"role": "assistant", "content": "first"})
+	second := MessageKey(map[string]any{"role": "assistant", "content": "second"})
+	if first == second {
+		t.Fatal("different assistant replies have the same history key")
 	}
 }
 

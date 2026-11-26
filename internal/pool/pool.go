@@ -130,7 +130,9 @@ func (q QuotaInfo) IsExhausted() bool {
 }
 
 type entry struct {
-	acct *auth.Account
+	acct              *auth.Account
+	credentialVersion uint64
+	credentialPending bool
 
 	disabled       bool
 	disabledReason string
@@ -208,8 +210,10 @@ type Pool struct {
 	notifyCh chan struct{}
 	waiters  int
 
-	refreshMu    sync.Mutex
-	refreshLocks map[string]*refLock
+	refreshMu       sync.Mutex
+	refreshLocks    map[string]*refLock
+	credentialLocks map[string]*refLock
+	credentialSeq   uint64
 
 	flushMu    sync.Mutex
 	dirtyGen   uint64
@@ -236,10 +240,11 @@ func New(cfg Config) *Pool {
 		cfg.Strategy = StrategyWeighted
 	}
 	p := &Pool{
-		cfg:          cfg,
-		byUID:        map[string]*entry{},
-		notifyCh:     make(chan struct{}),
-		refreshLocks: map[string]*refLock{},
+		cfg:             cfg,
+		byUID:           map[string]*entry{},
+		notifyCh:        make(chan struct{}),
+		refreshLocks:    map[string]*refLock{},
+		credentialLocks: map[string]*refLock{},
 	}
 	p.restoreState()
 	return p
@@ -280,11 +285,12 @@ func (p *Pool) SyncAccounts(accts []*auth.Account) {
 			continue
 		}
 		present[a.UID] = true
-		if e, ok := p.byUID[a.UID]; ok {
-			e.acct = a.Clone()
-		} else {
-			p.byUID[a.UID] = &entry{acct: a.Clone()}
+		e := p.byUID[a.UID]
+		if e == nil {
+			e = &entry{}
+			p.byUID[a.UID] = e
 		}
+		p.setCredentialLocked(e, a, false)
 	}
 	for uid := range p.byUID {
 		if !present[uid] {
@@ -315,7 +321,7 @@ func (p *Pool) AddOrUpdate(a *auth.Account) {
 		if !auth.IsDeviceID(next.DeviceID) && auth.IsDeviceID(prevDevice) {
 			next.DeviceID = prevDevice
 		}
-		e.acct = next
+		p.setCredentialLocked(e, next, false)
 		e.disabled = false
 		e.disabledReason = ""
 		e.cooldownUntil = time.Time{}
@@ -323,7 +329,9 @@ func (p *Pool) AddOrUpdate(a *auth.Account) {
 		e.consecFails = 0
 		e.softHits = 0
 	} else {
-		p.byUID[a.UID] = &entry{acct: a.Clone()}
+		e := &entry{}
+		p.setCredentialLocked(e, a, false)
+		p.byUID[a.UID] = e
 	}
 	p.rebuildOrderLocked()
 	p.dirtyGen++
@@ -340,19 +348,6 @@ func (p *Pool) Remove(uid string) {
 	p.signalWaitersLocked()
 	p.mu.Unlock()
 	_ = p.Flush()
-}
-
-func (p *Pool) Rename(uid, customName string) *auth.Account {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok || e.acct == nil {
-		return nil
-	}
-	e.acct.CustomName = strings.TrimSpace(customName)
-	e.acct.UpdatedAt = time.Now().UnixMilli()
-	p.dirtyGen++
-	return e.acct.Clone()
 }
 
 func (p *Pool) AuthByUID(uid string) *auth.Account {
@@ -382,7 +377,7 @@ func (p *Pool) AllAccounts(includeDisabled bool) []*auth.Account {
 	return out
 }
 
-func (p *Pool) UpdateAccount(updated *auth.Account) *auth.Account {
+func (p *Pool) updateRefreshedAccount(updated *auth.Account, pending bool) *auth.Account {
 	if updated == nil || updated.UID == "" {
 		return nil
 	}
@@ -399,7 +394,7 @@ func (p *Pool) UpdateAccount(updated *auth.Account) *auth.Account {
 	if e.acct != nil && !auth.IsDeviceID(cp.DeviceID) && auth.IsDeviceID(e.acct.DeviceID) {
 		cp.DeviceID = e.acct.DeviceID
 	}
-	e.acct = cp
+	p.setCredentialLocked(e, cp, pending)
 	if e.disabled && strings.Contains(strings.ToLower(e.disabledReason), "token") {
 		e.disabled = false
 		e.disabledReason = ""
@@ -469,6 +464,18 @@ func (p *Pool) SetAdvancedEnabled(uid string, enabled bool) {
 		p.signalWaitersLocked()
 	}
 	p.mu.Unlock()
+}
+
+// HasAttachmentAccount reports whether a configured account can upload images.
+func (p *Pool) HasAttachmentAccount(requireAdvanced bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, e := range p.byUID {
+		if e.acct != nil && !e.acct.IsGateway() && (!requireAdvanced || e.quota.AdvancedEnabled) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Pool) HasAdvancedAccount() bool {
@@ -637,7 +644,8 @@ type AcquireOptions struct {
 	MaxWaiters int
 	// RequireAdvanced restricts selection to accounts whose quota reports AdvancedEnabled.
 	// When no such account is eligible, ErrNoAdvancedAccounts is returned without waiting.
-	RequireAdvanced bool
+	RequireAdvanced    bool
+	RequireAttachments bool
 }
 
 // Acquire selects a healthy account with free concurrency capacity. If all healthy accounts
@@ -760,7 +768,7 @@ func (p *Pool) pickLocked(now time.Time, opts AcquireOptions) (acct *auth.Accoun
 		if !p.isEligibleLocked(e, now) {
 			continue
 		}
-		if opts.RequireAdvanced && !e.quota.AdvancedEnabled {
+		if (opts.RequireAdvanced && !e.quota.AdvancedEnabled) || (opts.RequireAttachments && e.acct.IsGateway()) {
 			continue
 		}
 		if e.quota.IsExhausted() {
@@ -885,11 +893,15 @@ func (p *Pool) signalWaitersLocked() {
 // WithRefreshLock serializes token refreshes per account UID so concurrent 401s
 // never issue duplicate refresh requests or race on rotated refresh tokens.
 func (p *Pool) WithRefreshLock(uid string, fn func() error) error {
+	return p.withUIDLock(p.refreshLocks, uid, fn)
+}
+
+func (p *Pool) withUIDLock(locks map[string]*refLock, uid string, fn func() error) error {
 	p.refreshMu.Lock()
-	rl, ok := p.refreshLocks[uid]
+	rl, ok := locks[uid]
 	if !ok {
 		rl = &refLock{}
-		p.refreshLocks[uid] = rl
+		locks[uid] = rl
 	}
 	rl.refs++
 	p.refreshMu.Unlock()
@@ -900,7 +912,7 @@ func (p *Pool) WithRefreshLock(uid string, fn func() error) error {
 		p.refreshMu.Lock()
 		rl.refs--
 		if rl.refs <= 0 {
-			delete(p.refreshLocks, uid)
+			delete(locks, uid)
 		}
 		p.refreshMu.Unlock()
 	}()

@@ -220,7 +220,7 @@
 
   async function loadOverview() {
     const data = await api("/panel/api/overview");
-    $("version-badge").textContent = "v" + (data.version || "0.1.2");
+    $("version-badge").textContent = data.version ? "v" + data.version : "";
     $("proto-pill").textContent = `Quick ${data.app_version || "1.2.4660"}`;
 
     const pool = data.pool || {};
@@ -698,7 +698,7 @@ API Key : ${keyDisplay}
     $("snippet-claude").textContent =
 `# PowerShell (Claude Code)
 $env:ANTHROPIC_BASE_URL = "${origin}"
-$env:ANTHROPIC_API_KEY  = "${keyDisplay}"
+$env:ANTHROPIC_AUTH_TOKEN = "${keyDisplay}"
 claude`;
 
     $("snippet-codex").textContent =

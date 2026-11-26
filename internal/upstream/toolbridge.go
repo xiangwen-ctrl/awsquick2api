@@ -55,6 +55,7 @@ type ResponseFormat struct {
 	Type   string
 	Name   string
 	Schema map[string]any
+	Strict bool
 }
 
 // ExtractToolDefs extracts function tool definitions from OpenAI `tools` and legacy `functions`.
@@ -138,6 +139,7 @@ func ParseResponseFormat(raw any) ResponseFormat {
 		rf := ResponseFormat{Type: "json_schema"}
 		if js, ok := m["json_schema"].(map[string]any); ok {
 			rf.Name, _ = js["name"].(string)
+			rf.Strict, _ = js["strict"].(bool)
 			if sc, ok := js["schema"].(map[string]any); ok {
 				rf.Schema = sc
 			}
@@ -320,7 +322,7 @@ func BuildToolBridgePrompt(defs []ToolDef, choice ToolChoice, parallel bool, det
 		"Available client-side tools:",
 		formatToolListing(defs, detail),
 		"",
-		"Invoke a client tool by emitting a raw tag containing JSON (no Markdown fences):",
+		"These tools run in the API caller. Return this raw tag in your reply to request execution, using the exact listed tool name (no Markdown fences):",
 		`<client_tool_call>{"name":"TOOL_NAME","arguments":{...}}</client_tool_call>`,
 		"Wait for the caller to return each tool result before continuing.",
 	}

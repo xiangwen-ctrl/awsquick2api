@@ -407,3 +407,48 @@ func TestDiffRestartFieldsPersistsAcrossMultipleSaves(t *testing.T) {
 		t.Fatalf("save 3 restart_required = %v, want empty", r3)
 	}
 }
+
+func TestInvalidEffectiveKeyLeavesSavedConfigurationIntact(t *testing.T) {
+	clearEnv(t)
+	path := filepath.Join(t.TempDir(), "config.json")
+	base := Default()
+	base.APIKey = "qk_before_save"
+	writeJSON(t, path, base)
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := []byte(`{"api_key":"replace_with_your_api_key"}`)
+	if _, _, err := SaveFull(path, invalid, base); err == nil {
+		t.Fatal("accepted the example inference key")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != string(original) {
+		t.Fatalf("rejected save changed the file, read error %v", err)
+	}
+	t.Setenv("AWSQUICK_API_KEY", "qk_from_environment")
+	next, _, err := SaveFull(path, invalid, base)
+	if err != nil || next.APIKey != "qk_from_environment" {
+		t.Fatalf("valid environment override did not apply: %v", err)
+	}
+}
+
+func TestThreadReuseRequiresNewExplicitSetting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	for _, tc := range []struct {
+		body string
+		want bool
+	}{
+		{`{}`, false},
+		{`{"upstream":{"stateful":true}}`, false},
+		{`{"upstream":{"single_client_thread_reuse":true}}`, true},
+	} {
+		if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadFileOnly(path)
+		if err != nil || cfg.Upstream.Stateful != tc.want {
+			t.Fatalf("unexpected reuse setting for %s: %v", tc.body, err)
+		}
+	}
+}

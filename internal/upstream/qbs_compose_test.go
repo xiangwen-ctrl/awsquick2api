@@ -285,16 +285,11 @@ func TestComposeCustomDigestMatchesSentPrompt(t *testing.T) {
 		t.Fatalf("expected full custom prompt to be re-sent on resume (sent=%d full=%d)", len(ct2.Input.SystemPrompt), len(pt2.fullCustom))
 	}
 
-	// Resumed turn still constrained: whatever is sent, the digest describes it.
-	ct3, _, err := composeFor(t, c, acct, cfg, req2, thread, 8192)
-	if err != nil {
-		t.Fatalf("turn 2 (small) compose: %v", err)
-	}
-	if ct3.Input.SystemPrompt != "" && ct3.CustomDigest != Digest(ct3.Input.SystemPrompt) {
-		t.Fatalf("digest does not match sent custom prompt")
-	}
-	if ct3.Input.SystemPrompt == "" && ct3.CustomDigest != thread.Custom {
-		t.Fatalf("skipped custom prompt must keep the thread digest")
+	// Resuming a constrained thread would change the committed context. Start fresh.
+	_, _, err = composeFor(t, c, acct, cfg, req2, thread, 8192)
+	var resumeErr *UpstreamError
+	if !errors.As(err, &resumeErr) || resumeErr.Code != "thread_resume_frame_limit" {
+		t.Fatalf("expected fresh thread for a constrained resume, got %v", err)
 	}
 
 	// Thread already holds the full prompt: nothing is re-sent.

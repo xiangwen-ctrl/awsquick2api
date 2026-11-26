@@ -2,7 +2,6 @@ package upstream
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -137,35 +136,18 @@ func ContentText(content any, images *[]InlineImage, totalImageBytes *int) strin
 			}
 		case "image_url", "input_image":
 			u := extractImageURL(part)
-			if m := dataImageRE.FindStringSubmatch(u); m != nil && images != nil {
-				mimeType := strings.ToLower(m[1])
-				if ext, ok := imageExts[mimeType]; ok && len(*images) < maxImagesPerRequest {
-					b64 := strings.Map(func(r rune) rune {
-						if unicode.IsSpace(r) {
-							return -1
-						}
-						return r
-					}, m[2])
-					decoded, err := base64.StdEncoding.DecodeString(b64)
-					if err == nil && len(decoded) > 0 && len(decoded) <= maxSingleImageBytes && validateImageMagic(mimeType, decoded) {
-						curTotal := 0
-						if totalImageBytes != nil {
-							curTotal = *totalImageBytes
-						}
-						if curTotal+len(decoded) <= maxTotalImageBytes {
-							name := fmt.Sprintf("image_%d.%s", len(*images)+1, ext)
-							*images = append(*images, InlineImage{
-								Name:     name,
-								MimeType: mimeType,
-								Bytes:    decoded,
-							})
-							if totalImageBytes != nil {
-								*totalImageBytes = curTotal + len(decoded)
-							}
-							sb.WriteString(fmt.Sprintf("[image: attached file %s]", name))
-							continue
-						}
+			if images != nil {
+				used := 0
+				if totalImageBytes != nil {
+					used = *totalImageBytes
+				}
+				if img, ok := decodeInlineImage(u, len(*images), used); ok {
+					*images = append(*images, img)
+					if totalImageBytes != nil {
+						*totalImageBytes += len(img.Bytes)
 					}
+					sb.WriteString("[image: attached file " + img.Name + "]")
+					continue
 				}
 			}
 			if u != "" && !strings.HasPrefix(strings.ToLower(u), "data:") {

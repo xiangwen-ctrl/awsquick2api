@@ -48,8 +48,8 @@ func TestExtractBearer(t *testing.T) {
 
 func TestVerifyBearer(t *testing.T) {
 	reqNoAuth := httptest.NewRequest(http.MethodGet, "/", nil)
-	if !VerifyBearer(reqNoAuth, "") {
-		t.Fatal("empty want should disable auth")
+	if VerifyBearer(reqNoAuth, "") {
+		t.Fatal("empty want should reject auth")
 	}
 	if VerifyBearer(reqNoAuth, "qk_secret") {
 		t.Fatal("missing header must be rejected when want is set")
@@ -68,10 +68,10 @@ func TestVerifyBearer(t *testing.T) {
 func TestVerifyAnthropicAndDual(t *testing.T) {
 	const want = "qk_expected_key"
 
-	// Empty want disables auth.
+	// Empty want rejects auth.
 	emptyReq := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
-	if !VerifyAnthropic(emptyReq, "") || !VerifyDual(emptyReq, "") {
-		t.Fatal("empty want should pass")
+	if VerifyAnthropic(emptyReq, "") || VerifyDual(emptyReq, "") {
+		t.Fatal("empty want should reject auth")
 	}
 
 	// Valid x-api-key passes.

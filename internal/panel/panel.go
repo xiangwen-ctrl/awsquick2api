@@ -641,7 +641,9 @@ func (p *Panel) handleAccountDisable(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Reason string `json:"reason"`
 	}
-	_ = decodeJSONOptional(w, r, &req)
+	if !decodeJSONOptional(w, r, &req) {
+		return
+	}
 	if strings.TrimSpace(req.Reason) == "" {
 		req.Reason = "manual_disabled"
 	}
@@ -730,15 +732,15 @@ func (p *Panel) handleAccountRename(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	updated := p.cfg.Pool.Rename(uid, req.Name)
+	store := pool.CredentialStore{Pool: p.cfg.Pool, Dir: p.cfg.AuthDir, Vault: p.cfg.Vault}
+	updated, err := store.Rename(uid, req.Name)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
 	if updated == nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found"})
 		return
-	}
-	if p.cfg.AuthDir != "" {
-		if err := auth.SaveAccount(p.cfg.AuthDir, p.cfg.Vault, updated); err != nil {
-			log.Printf("WARN: [panel] save renamed account %s: %v", uid, err)
-		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "display_name": updated.DisplayName(), "custom_name": updated.CustomName})
 }
@@ -749,13 +751,11 @@ func (p *Panel) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid uid"})
 		return
 	}
-	if p.cfg.AuthDir != "" {
-		if err := auth.DeleteAccount(p.cfg.AuthDir, uid); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
-		}
+	store := pool.CredentialStore{Pool: p.cfg.Pool, Dir: p.cfg.AuthDir, Vault: p.cfg.Vault}
+	if err := store.Delete(uid); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
 	}
-	p.cfg.Pool.Remove(uid)
 	if p.cfg.Session != nil {
 		p.cfg.Session.UnbindAccount(uid)
 	}

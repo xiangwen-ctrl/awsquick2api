@@ -42,11 +42,18 @@ type Config struct {
 	Models   ModelsConfig   `json:"models"`
 }
 
+const (
+	DefaultMaxPayloadBytes         = 24 << 20
+	DefaultMaxInflightPayloadBytes = 32 << 20
+	ExampleAPIKey                  = "replace_with_your_api_key"
+)
+
 type ServerConfig struct {
-	ReadTimeoutSeconds     int      `json:"read_timeout_seconds"`
-	ShutdownTimeoutSeconds int      `json:"shutdown_timeout_seconds"`
-	MaxPayloadBytes        int64    `json:"max_payload_bytes"`
-	TrustedHosts           []string `json:"trusted_hosts,omitempty"`
+	ReadTimeoutSeconds      int      `json:"read_timeout_seconds"`
+	ShutdownTimeoutSeconds  int      `json:"shutdown_timeout_seconds"`
+	MaxPayloadBytes         int64    `json:"max_payload_bytes"`
+	MaxInflightPayloadBytes int64    `json:"max_inflight_payload_bytes"`
+	TrustedHosts            []string `json:"trusted_hosts,omitempty"`
 }
 
 type UpstreamConfig struct {
@@ -64,7 +71,7 @@ type UpstreamConfig struct {
 	Timezone                string `json:"timezone"`
 	Locale                  string `json:"locale"`
 	DefaultModel            string `json:"default_model"`
-	Stateful                bool   `json:"stateful"`
+	Stateful                bool   `json:"single_client_thread_reuse"`
 	Attachments             bool   `json:"attachments"`
 	MaxFrameBytes           int    `json:"max_frame_bytes"`
 	KeepSessions            bool   `json:"keep_sessions"`
@@ -127,9 +134,10 @@ func Default() *Config {
 		AuthDir:  "./auths",
 		DataDir:  "./data",
 		Server: ServerConfig{
-			ReadTimeoutSeconds:     300,
-			ShutdownTimeoutSeconds: 30,
-			MaxPayloadBytes:        64 << 20,
+			ReadTimeoutSeconds:      300,
+			ShutdownTimeoutSeconds:  30,
+			MaxPayloadBytes:         DefaultMaxPayloadBytes,
+			MaxInflightPayloadBytes: DefaultMaxInflightPayloadBytes,
 		},
 		Upstream: UpstreamConfig{
 			AppVersion:              "1.2.4660",
@@ -146,7 +154,6 @@ func Default() *Config {
 			Timezone:                "UTC",
 			Locale:                  "en-US",
 			DefaultModel:            "smart",
-			Stateful:                true,
 			Attachments:             true,
 			MaxFrameBytes:           63000,
 			KeepSessions:            false,
@@ -206,6 +213,12 @@ func GenerateAPIKey() string { return randomHexKey("qk_") }
 
 // GenerateAdminKey generates a cryptographically random "qka_" prefixed panel admin key.
 func GenerateAdminKey() string { return randomHexKey("qka_") }
+
+// ValidAPIKey reports whether a configured inference key is usable.
+func ValidAPIKey(key string) bool {
+	key = strings.TrimSpace(key)
+	return key != "" && key != ExampleAPIKey
+}
 
 // WriteDefault creates a fresh config.json with independent random api_key and admin_key.
 func WriteDefault(path string) (apiKey string, adminKey string, err error) {
@@ -393,7 +406,7 @@ func (c *Config) normalize() {
 		c.Server.ShutdownTimeoutSeconds = 30
 	}
 	if c.Server.MaxPayloadBytes <= 0 {
-		c.Server.MaxPayloadBytes = 64 << 20
+		c.Server.MaxPayloadBytes = DefaultMaxPayloadBytes
 	}
 	if c.Server.MaxPayloadBytes < 8<<20 {
 		c.Server.MaxPayloadBytes = 8 << 20
@@ -401,6 +414,11 @@ func (c *Config) normalize() {
 	if c.Server.MaxPayloadBytes > 512<<20 {
 		c.Server.MaxPayloadBytes = 512 << 20
 	}
+	c.Server.MaxInflightPayloadBytes = min(c.Server.MaxInflightPayloadBytes, 512<<20)
+	if c.Server.MaxInflightPayloadBytes <= 0 {
+		c.Server.MaxInflightPayloadBytes = DefaultMaxInflightPayloadBytes
+	}
+	c.APIKey = strings.TrimSpace(c.APIKey)
 	if len(c.Server.TrustedHosts) > 0 {
 		seen := make(map[string]bool, len(c.Server.TrustedHosts))
 		cleaned := make([]string, 0, len(c.Server.TrustedHosts))
@@ -592,16 +610,18 @@ func SaveFull(path string, raw []byte, oldCfg *Config) (*Config, []string, error
 		return nil, nil, err
 	}
 	outBytes = append(outBytes, '\n')
-	if err := safefile.WriteAtomic(path, outBytes, 0o600); err != nil {
-		return nil, nil, err
-	}
-
 	next := Default()
 	if err := json.Unmarshal(outBytes, next); err != nil {
 		return nil, nil, fmt.Errorf("validate saved config: %w", err)
 	}
 	next.applyEnv()
 	next.normalize()
+	if !ValidAPIKey(next.APIKey) {
+		return nil, nil, fmt.Errorf("set a valid api_key in config or AWSQUICK_API_KEY")
+	}
+	if err := safefile.WriteAtomic(path, outBytes, 0o600); err != nil {
+		return nil, nil, err
+	}
 	// The running config has auth_dir / data_dir anchored to the config directory;
 	// anchor the new one the same way so unchanged relative paths do not diff.
 	if filepath.IsAbs(path) {
@@ -653,6 +673,9 @@ func diffRestartFields(oldCfg, next *Config) []string {
 	}
 	if oldCfg.Server.MaxPayloadBytes != next.Server.MaxPayloadBytes {
 		restartFields = append(restartFields, "server.max_payload_bytes")
+	}
+	if oldCfg.Server.MaxInflightPayloadBytes != next.Server.MaxInflightPayloadBytes {
+		restartFields = append(restartFields, "server.max_inflight_payload_bytes")
 	}
 	return restartFields
 }

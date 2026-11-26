@@ -140,6 +140,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 				s.RefreshAllQuotas(ctx)
 			}
 			if cfg.Pool != nil {
+				s.flushPendingCredentials(ctx, pool.CredentialStore{Pool: cfg.Pool, Dir: cfg.AuthDir, Vault: cfg.Vault})
 				_ = cfg.Pool.Flush()
 			}
 		}
@@ -162,8 +163,15 @@ func (s *Scheduler) RefreshOneTokenIfStale(ctx context.Context, uid, staleAccess
 		return fmt.Errorf("scheduler not initialized")
 	}
 
+	store := pool.CredentialStore{Pool: p, Dir: authDir, Vault: vault}
 	return p.WithRefreshLock(uid, func() error {
-		acct := p.AuthByUID(uid)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := store.FlushPending(uid); err != nil {
+			return err
+		}
+		acct, version := p.CredentialSnapshot(uid)
 		if acct == nil {
 			return fmt.Errorf("account %q not found", uid)
 		}
@@ -178,22 +186,16 @@ func (s *Scheduler) RefreshOneTokenIfStale(ctx context.Context, uid, staleAccess
 		if err != nil {
 			var se *auth.StepError
 			if errors.As(err, &se) && se.Expired {
-				p.Disable(uid, "token_expired: "+reqlog.ScrubCredentials(se.Message))
+				store.DisableExpired(uid, version, "token_expired: "+reqlog.ScrubCredentials(se.Message))
+			}
+			if _, currentVersion := p.CredentialSnapshot(uid); currentVersion != version {
+				return nil
 			}
 			return err
 		}
-		if updated == nil {
-			return fmt.Errorf("account %q: refresh returned no account", uid)
-		}
-
-		saved := p.UpdateAccount(updated)
+		saved, persistErr := store.CommitRefresh(uid, version, updated)
 		if saved == nil {
-			saved = updated
-		}
-		if authDir != "" && vault != nil {
-			if serr := auth.SaveAccount(authDir, vault, saved); serr != nil {
-				log.Printf("WARN: [scheduler] save refreshed account %s: %s", uid, reqlog.ScrubCredentials(serr.Error()))
-			}
+			return persistErr
 		}
 
 		s.retryMu.Lock()
@@ -208,8 +210,22 @@ func (s *Scheduler) RefreshOneTokenIfStale(ctx context.Context, uid, staleAccess
 
 		log.Printf("[scheduler] refreshed token acct=%s provider=%s next_exp=%s",
 			uid, saved.Provider, time.UnixMilli(saved.ExpiresAt).Format(time.RFC3339))
-		return nil
+		if persistErr != nil {
+			log.Printf("WARN: [scheduler] account %s will retry credential write: %s", uid, reqlog.ScrubCredentials(persistErr.Error()))
+		}
+		return persistErr
 	})
+}
+
+func (s *Scheduler) flushPendingCredentials(ctx context.Context, store pool.CredentialStore) {
+	for _, uid := range store.PendingUIDs() {
+		if ctx.Err() != nil {
+			return
+		}
+		if _, err := store.FlushPending(uid); err != nil {
+			log.Printf("WARN: [scheduler] retry credential write for %s: %s", uid, reqlog.ScrubCredentials(err.Error()))
+		}
+	}
 }
 
 func (s *Scheduler) RefreshExpiringTokens(ctx context.Context) {

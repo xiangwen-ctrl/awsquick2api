@@ -115,7 +115,15 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 	if err != nil {
 		return ChatResult{}, err
 	}
-	acctKey := acct.TenantURL + "|" + acct.UID
+	reuse := cfg.Stateful && c.Threads != nil && len(pt.keys) > 0
+	var acctKey, threadSession string
+	if reuse {
+		// A replaced upstream credential starts with its own history.
+		accountBinding, _ := json.Marshal([]string{acct.TenantURL, acct.Provider, acct.UID, acct.AccessToken})
+		acctKey = Digest(string(accountBinding))
+		policyBinding, _ := json.Marshal([]any{req.Slot, req.ThinkingEffort, pt.webSearch, req.MaxOutputTokens, pt.fullCustom, pt.respFmt, cfg.KeepSessions})
+		threadSession = req.ThreadSession + ":" + Digest(string(policyBinding))
+	}
 	strictDLP := true
 	if req.StrictPrivacyDLP != nil {
 		strictDLP = *req.StrictPrivacyDLP
@@ -169,9 +177,10 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 		)
 		// When response_format is json_object/json_schema, text must be cleaned and validated
 		// before emission, so even with tools enabled we buffer text instead of streaming raw deltas.
-		streamBridge := pt.bridge && req.Stream && onEvent != nil && pt.respFmt.Type == "text"
-		needRsnStream := onEvent != nil
-		needTextStream := streamBridge || (onEvent != nil && !pt.bridge && pt.respFmt.Type == "text")
+		liveOutput := onEvent != nil && !req.DelayOutput()
+		streamBridge := pt.bridge && req.Stream && liveOutput && pt.respFmt.Type == "text"
+		needRsnStream := liveOutput
+		needTextStream := streamBridge || (liveOutput && !pt.bridge && pt.respFmt.Type == "text")
 		initStreamGuards := func() {
 			streamedTxt.Reset()
 			if streamBridge {
@@ -244,11 +253,23 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 			return ChatResult{}, werr
 		}
 
+		if req.MaxOutputTokens > 0 && (!res.Usage.OutputTokensKnown || res.Usage.CompletionTokens > req.MaxOutputTokens) {
+			if thread != nil {
+				c.Threads.Drop(thread.ID)
+			}
+			if !res.Usage.OutputTokensKnown {
+				return ChatResult{}, &UpstreamError{Kind: ErrKindCompletion, StatusCode: 502, Code: "upstream_usage_unavailable", Message: "Amazon Quick did not report valid output token usage"}
+			}
+			return ChatResult{Usage: res.Usage, OutputLimitReached: true, ThreadID: threadID, ThreadReused: thread != nil}, nil
+		}
+
 		rsnGuard.Finish()
 		textGuard.Finish()
 
+		rawText, rawReasoning := res.Text, res.Reasoning
 		res.Text = piiPolicy.Scrub(res.Text)
 		res.Reasoning = piiPolicy.Scrub(res.Reasoning)
+		outputRedacted := rawText != res.Text || rawReasoning != res.Reasoning
 
 		// Finalize tool calls & response_format output.
 		var calls []ToolCall
@@ -266,62 +287,44 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 			if !pt.parallel && len(calls) > 1 {
 				calls = calls[:1]
 			}
-			// tools + response_format: a plain (non tool-call) answer must still
-			// satisfy the requested JSON format (both buffered and streaming paths).
-			if pt.respFmt.Type != "" && pt.respFmt.Type != "text" {
-				if len(calls) == 0 {
-					cleaned := CleanJSONOutput(finalText)
-					var obj map[string]any
-					if jerr := json.Unmarshal([]byte(cleaned), &obj); jerr != nil || obj == nil {
-						if thread != nil {
-							c.Threads.Drop(thread.ID)
-						}
-						return ChatResult{}, (&UpstreamError{
-							Kind:       ErrKindUpstream,
-							StatusCode: 502,
-							Message:    "Amazon Quick 未返回符合 response_format 的有效 JSON 对象",
-						}).Normalize()
-					}
-					finalText = cleaned
-				}
-				if req.Stream && onEvent != nil && finalText != "" {
-					onEvent(ChatEvent{Type: "text", Text: finalText})
-				}
-			}
-		} else if pt.respFmt.Type != "text" {
-			cleaned := CleanJSONOutput(res.Text)
-			var obj map[string]any
-			// "null" unmarshals into a nil map without error; json_object requires an object.
-			if jerr := json.Unmarshal([]byte(cleaned), &obj); jerr != nil || obj == nil {
+		}
+
+		if pt.respFmt.Type != "text" && len(calls) == 0 {
+			cleaned, validationErr := pt.validateJSONOutput(finalText)
+			if validationErr != nil {
 				if thread != nil {
 					c.Threads.Drop(thread.ID)
 				}
-				return ChatResult{}, (&UpstreamError{
-					Kind:       ErrKindUpstream,
-					StatusCode: 502,
-					Message:    "Amazon Quick 未返回符合 response_format 的有效 JSON 对象",
-				}).Normalize()
+				return ChatResult{}, validationErr
 			}
 			finalText = cleaned
-			if req.Stream && onEvent != nil && finalText != "" {
+		}
+		if req.Stream && onEvent != nil {
+			if !liveOutput && res.Reasoning != "" {
+				onEvent(ChatEvent{Type: "reasoning", Text: res.Reasoning})
+			}
+			if (!needTextStream || !liveOutput) && finalText != "" {
 				onEvent(ChatEvent{Type: "text", Text: finalText})
 			}
 		}
 
-		if cfg.Stateful && c.Threads != nil {
-			c.Threads.Commit(threadID, acctKey, req.ConversationID, composed.CustomDigest, pt.keys)
-		}
-
 		res.Text = finalText
 		res.ToolCalls = calls
+		if reuse && composed.ExactHistory && !outputRedacted && (strings.TrimSpace(finalText) != "" || len(calls) > 0) {
+			keys := append(pt.keys, assistantReplyKey(res))
+			c.Threads.Commit(threadID, acctKey, threadSession, composed.CustomDigest, keys)
+		} else if thread != nil {
+			c.Threads.Drop(thread.ID)
+		}
+
 		res.ThreadReused = thread != nil
 		res.ThreadID = threadID
 		return res, nil
 	}
 
 	var matched *ThreadEntry
-	if cfg.Stateful && c.Threads != nil {
-		matched = c.Threads.Match(acctKey, req.ConversationID, pt.keys)
+	if reuse {
+		matched = c.Threads.Match(acctKey, threadSession, pt.keys)
 	}
 	res, err := runAttempt(matched)
 	if err != nil && matched != nil && ctx.Err() == nil && !emittedAny {
@@ -329,7 +332,7 @@ func (c *Client) Chat(ctx context.Context, acct *auth.Account, req ChatRequest, 
 		// If a resumed thread failed before any output reached the caller, retry cleanly on a
 		// fresh full-history thread. Handshake, guardrail and invalid-request failures are not
 		// caused by the stale thread, so retrying them only doubles cost.
-		if !errors.As(err, &ue) || (ue.Kind != ErrKindHandshake && ue.Kind != ErrKindBlocked && ue.Kind != ErrKindInvalid) {
+		if !errors.As(err, &ue) || (ue.Kind != ErrKindHandshake && ue.Kind != ErrKindBlocked && ue.Kind != ErrKindInvalid && ue.Kind != ErrKindCompletion) {
 			res, err = runAttempt(nil)
 		}
 	}

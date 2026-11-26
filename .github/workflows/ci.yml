@@ -48,6 +48,10 @@ jobs:
           CGO_ENABLED: "0"
         run: go test -count=1 ./...
 
+      - name: Scan Go dependencies
+        if: runner.os == 'Linux'
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
+
       - name: Check panel JS syntax
         run: node --check internal/panel/web/app.js
 

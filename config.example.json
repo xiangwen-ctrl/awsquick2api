@@ -7,7 +7,8 @@
   "server": {
     "read_timeout_seconds": 300,
     "shutdown_timeout_seconds": 30,
-    "max_payload_bytes": 67108864,
+    "max_payload_bytes": 25165824,
+    "max_inflight_payload_bytes": 33554432,
     "trusted_hosts": []
   },
   "upstream": {
@@ -25,7 +26,7 @@
     "timezone": "UTC",
     "locale": "en-US",
     "default_model": "smart",
-    "stateful": true,
+    "single_client_thread_reuse": false,
     "attachments": true,
     "max_frame_bytes": 63000,
     "keep_sessions": false,

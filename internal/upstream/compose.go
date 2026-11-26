@@ -36,35 +36,53 @@ type ChatRequest struct {
 	ResponseFormat    any
 	WebSearch         *bool
 	ConversationID    string
+	ThreadSession     string // gateway-authenticated binding for the explicit conversation
+	MaxOutputTokens   int
 	Stream            bool
 	StrictPrivacyDLP  *bool
+	imagesValidated   bool
+	images            []InlineImage
+	imageMessages     []map[string]any
+}
+
+// DelayOutput reports whether output must be checked before opening the downstream stream.
+func (r ChatRequest) DelayOutput() bool {
+	return r.MaxOutputTokens > 0 || ParseResponseFormat(r.ResponseFormat).Strict
 }
 
 type preparedTurn struct {
-	req           ChatRequest
-	convo         []map[string]any
-	keys          []string
-	system        string
-	privacyNote   string
-	toolDefs      []ToolDef
-	choice        ToolChoice
-	parallel      bool
-	bridge        bool
-	bridgeAllowed map[string]bool
-	respFmt       ResponseFormat
-	respFmtPrompt string
-	title         string
-	fullCustom    string
-	webSearch     bool
-	toolCache     map[string]string
+	req            ChatRequest
+	convo          []map[string]any
+	keys           []string
+	system         string
+	privacyNote    string
+	toolDefs       []ToolDef
+	choice         ToolChoice
+	parallel       bool
+	bridge         bool
+	bridgeAllowed  map[string]bool
+	respFmt        ResponseFormat
+	respFmtPrompt  string
+	validateSchema func(any) error
+	title          string
+	fullCustom     string
+	webSearch      bool
+	toolCache      map[string]string
 }
 
 func prepareTurn(req ChatRequest, cfg config.UpstreamConfig) (*preparedTurn, error) {
 	if len(req.Messages) == 0 {
 		return nil, &UpstreamError{Kind: ErrKindInvalid, StatusCode: 400, Message: "messages must not be empty"}
 	}
-	convo := make([]map[string]any, 0, len(req.Messages))
-	for _, m := range req.Messages {
+	if _, err := req.ValidateImageInputs(cfg.Attachments); err != nil {
+		return nil, err
+	}
+	messages := req.Messages
+	if req.imageMessages != nil {
+		messages = req.imageMessages
+	}
+	convo := make([]map[string]any, 0, len(messages))
+	for _, m := range messages {
 		if !IsSystemMessage(m) {
 			convo = append(convo, m)
 		}
@@ -91,6 +109,10 @@ func prepareTurn(req ChatRequest, cfg config.UpstreamConfig) (*preparedTurn, err
 		parallel = *req.ParallelToolCalls
 	}
 	respFmt := ParseResponseFormat(req.ResponseFormat)
+	validateSchema, err := compileResponseSchema(respFmt)
+	if err != nil {
+		return nil, err
+	}
 	respFmtPrompt := BuildResponseFormatPrompt(respFmt)
 
 	strictDLP := true
@@ -103,21 +125,24 @@ func prepareTurn(req ChatRequest, cfg config.UpstreamConfig) (*preparedTurn, err
 	}
 
 	pt := &preparedTurn{
-		req:           req,
-		convo:         convo,
-		system:        SystemText(req.Messages),
-		privacyNote:   privacyNote,
-		toolDefs:      toolDefs,
-		choice:        choice,
-		parallel:      parallel,
-		respFmt:       respFmt,
-		respFmtPrompt: respFmtPrompt,
-		title:         TitleFor(LastUserText(req.Messages)),
-		toolCache:     map[string]string{},
+		req:            req,
+		convo:          convo,
+		system:         SystemText(req.Messages),
+		privacyNote:    privacyNote,
+		toolDefs:       toolDefs,
+		choice:         choice,
+		parallel:       parallel,
+		respFmt:        respFmt,
+		respFmtPrompt:  respFmtPrompt,
+		validateSchema: validateSchema,
+		title:          TitleFor(LastUserText(req.Messages)),
+		toolCache:      map[string]string{},
 	}
-	pt.keys = make([]string, len(convo))
-	for i, m := range convo {
-		pt.keys[i] = MessageKey(m)
+	if cfg.Stateful && req.ThreadSession != "" && len(req.images) == 0 {
+		pt.keys = make([]string, len(convo))
+		for i, m := range convo {
+			pt.keys[i] = MessageKey(m)
+		}
 	}
 
 	fullTools := pt.toolsPrompt("full")
@@ -170,6 +195,7 @@ type turnInput struct {
 type composedTurn struct {
 	Input        turnInput
 	CustomDigest string
+	ExactHistory bool
 }
 
 func middleCut(text string, keepRunes int) string {
@@ -217,7 +243,11 @@ func (c *Client) composeTurn(
 		startIdx = len(thread.Keys)
 	}
 	fresh := pt.convo[startIdx:]
-	blocks, images, err := PromptBlocks(fresh, pt.convo, cfg.Attachments && !gateway)
+	images := pt.req.images
+	if len(images) != 0 && gateway {
+		return composedTurn{}, imageInputError("Selected account cannot send image attachments")
+	}
+	blocks, _, err := PromptBlocks(fresh, pt.convo, false)
 	if err != nil {
 		return composedTurn{}, &UpstreamError{Kind: ErrKindInvalid, StatusCode: 400, Message: err.Error()}
 	}
@@ -279,11 +309,15 @@ func (c *Client) composeTurn(
 		}
 	}
 
+	originalPrompt := input.Prompt
 	askedDigest := Digest(pt.fullCustom)
 	if thread != nil && thread.Custom == askedDigest {
 		input.SystemPrompt = ""
 	}
 	instructed := input.SystemPrompt != ""
+	if thread != nil && !fits() {
+		return composedTurn{}, (&UpstreamError{Kind: ErrKindTransport, Code: "thread_resume_frame_limit", Message: "The resumed turn requires a fresh thread"}).Normalize()
+	}
 
 	// Stage 1 & 2: Compact tool schemas and system instructions if frame exceeds limit.
 	if !fits() && instructed {
@@ -407,5 +441,6 @@ func (c *Client) composeTurn(
 	} else if thread != nil {
 		customDigest = thread.Custom
 	}
-	return composedTurn{Input: input, CustomDigest: customDigest}, nil
+	exact := input.Prompt == originalPrompt && (pt.fullCustom == "" || customDigest == askedDigest)
+	return composedTurn{Input: input, CustomDigest: customDigest, ExactHistory: exact}, nil
 }

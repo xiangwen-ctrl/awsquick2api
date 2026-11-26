@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"strings"
 	"sync"
@@ -48,30 +49,51 @@ func Digest(text string) string {
 	return hex.EncodeToString(sum[:12])
 }
 
-// MessageKey produces a stable matching key for conversation prefix comparison.
-// Assistant messages match by role alone because clients often re-format prior assistant replies.
+// MessageKey hashes the complete normalized message, including assistant replies.
 func MessageKey(m map[string]any) string {
 	role := msgRole(m)
-	if role == "assistant" {
-		return "assistant"
-	}
-	tcID, _ := m["tool_call_id"].(string)
-	name, _ := m["name"].(string)
-	body := ContentText(m["content"], nil, nil)
-	// ContentText drops image parts, so two turns that differ only by their
-	// attached image would collide. Fold the raw structured content in too.
-	if content, ok := m["content"]; ok && content != nil {
-		if _, isStr := content.(string); !isStr {
-			if raw, err := json.Marshal(content); err == nil {
-				body += "\n" + string(raw)
+	normalized := maps.Clone(m)
+	normalized["role"] = role
+	switch content := m["content"].(type) {
+	case nil:
+		normalized["content"] = ""
+	case []any:
+		var text strings.Builder
+		allText := true
+		for _, part := range content {
+			p, _ := part.(map[string]any)
+			kind, _ := p["type"].(string)
+			value, ok := p["text"].(string)
+			if !ok || len(p) != 2 || (kind != "text" && kind != "input_text" && kind != "output_text") {
+				allText = false
+				break
 			}
+			text.WriteString(value)
+		}
+		if allText {
+			normalized["content"] = text.String()
 		}
 	}
-	flags := ""
-	if isErr, _ := m["is_error"].(bool); isErr {
-		flags = "\nis_error"
+	raw, _ := json.Marshal(normalized)
+	return role + ":" + Digest(string(raw))
+}
+
+func assistantReplyKey(res ChatResult) string {
+	msg := map[string]any{"role": "assistant", "content": res.Text}
+	if res.Reasoning != "" {
+		msg["reasoning_content"] = res.Reasoning
 	}
-	return role + ":" + Digest(tcID+"\n"+name+flags+"\n"+body)
+	if len(res.ToolCalls) > 0 {
+		calls := make([]any, 0, len(res.ToolCalls))
+		for _, call := range res.ToolCalls {
+			calls = append(calls, map[string]any{
+				"id": call.ID, "type": "function",
+				"function": map[string]any{"name": call.Name, "arguments": call.Arguments},
+			})
+		}
+		msg["tool_calls"] = calls
+	}
+	return MessageKey(msg)
 }
 
 // ThreadEntry tracks one active Amazon Quick server-side thread and its committed history keys.
@@ -101,7 +123,7 @@ func NewThreadStore() *ThreadStore {
 
 // Match finds and claims (marks Busy=true) the longest matching thread for (account, session, keys).
 func (s *ThreadStore) Match(account, session string, keys []string) *ThreadEntry {
-	if s == nil || len(keys) == 0 {
+	if s == nil || session == "" || len(keys) == 0 {
 		return nil
 	}
 	s.mu.Lock()
@@ -109,6 +131,7 @@ func (s *ThreadStore) Match(account, session string, keys []string) *ThreadEntry
 
 	now := time.Now()
 	var best *ThreadEntry
+	ambiguous := false
 	for id, t := range s.threads {
 		if now.Sub(t.At) > threadTTL {
 			delete(s.threads, id)
@@ -118,7 +141,7 @@ func (s *ThreadStore) Match(account, session string, keys []string) *ThreadEntry
 		if t.Busy || t.Account != account || t.Session != session {
 			continue
 		}
-		if len(t.Keys) >= len(keys) || (best != nil && len(t.Keys) <= len(best.Keys)) {
+		if len(t.Keys) >= len(keys) || (best != nil && len(t.Keys) < len(best.Keys)) {
 			continue
 		}
 		matched := true
@@ -129,15 +152,16 @@ func (s *ThreadStore) Match(account, session string, keys []string) *ThreadEntry
 			}
 		}
 		if matched {
+			ambiguous = best != nil && len(t.Keys) == len(best.Keys)
 			best = t
 		}
 	}
-	if best == nil {
+	if best == nil || ambiguous {
 		return nil
 	}
 	// Newly added messages must not already include an assistant turn written elsewhere.
 	for _, k := range keys[len(best.Keys):] {
-		if k == "assistant" {
+		if strings.HasPrefix(k, "assistant:") {
 			return nil
 		}
 	}
@@ -149,7 +173,7 @@ func (s *ThreadStore) Match(account, session string, keys []string) *ThreadEntry
 
 // Commit records a completed turn (including the assistant reply) onto threadID.
 func (s *ThreadStore) Commit(threadID, account, session, customDigest string, keys []string) {
-	if s == nil || threadID == "" {
+	if s == nil || threadID == "" || session == "" || len(keys) == 0 {
 		return
 	}
 	s.mu.Lock()
@@ -164,16 +188,12 @@ func (s *ThreadStore) Commit(threadID, account, session, customDigest string, ke
 		delete(s.threads, oldest)
 	}
 
-	nextKeys := make([]string, len(keys)+1)
-	copy(nextKeys, keys)
-	nextKeys[len(keys)] = "assistant"
-
 	s.threads[threadID] = &ThreadEntry{
 		ID:      threadID,
 		Account: account,
 		Session: session,
 		Custom:  customDigest,
-		Keys:    nextKeys,
+		Keys:    append([]string(nil), keys...),
 		Busy:    false,
 		At:      time.Now(),
 	}

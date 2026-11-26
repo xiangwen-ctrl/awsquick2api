@@ -28,10 +28,10 @@ func ExtractBearer(r *http.Request) string {
 	return strings.TrimSpace(h[7:])
 }
 
-// VerifyBearer checks Authorization: Bearer against want. Empty want disables auth.
+// VerifyBearer checks Authorization: Bearer against want. Empty want rejects authentication.
 func VerifyBearer(r *http.Request, want string) bool {
 	if want == "" {
-		return true
+		return false
 	}
 	got := ExtractBearer(r)
 	return got != "" && Equal(got, want)
@@ -40,7 +40,7 @@ func VerifyBearer(r *http.Request, want string) bool {
 // VerifyAnthropic checks x-api-key first, then Authorization: Bearer.
 func VerifyAnthropic(r *http.Request, want string) bool {
 	if want == "" {
-		return true
+		return false
 	}
 	if k := strings.TrimSpace(r.Header.Get("x-api-key")); k != "" {
 		return Equal(k, want)

@@ -9,13 +9,14 @@ import (
 )
 
 const (
-	ErrKindHandshake = "handshake"
-	ErrKindUpstream  = "upstream"
-	ErrKindTooLarge  = "too_large"
-	ErrKindBlocked   = "blocked"
-	ErrKindTimeout   = "timeout"
-	ErrKindTransport = "transport"
-	ErrKindInvalid   = "invalid_request"
+	ErrKindHandshake  = "handshake"
+	ErrKindUpstream   = "upstream"
+	ErrKindTooLarge   = "too_large"
+	ErrKindBlocked    = "blocked"
+	ErrKindTimeout    = "timeout"
+	ErrKindTransport  = "transport"
+	ErrKindInvalid    = "invalid_request"
+	ErrKindCompletion = "invalid_completion"
 )
 
 var throttledRE = regexp.MustCompile(`(?i)throttl|rate.?limit|too many requests|quota|limit exceeded|capacity`)
@@ -67,7 +68,7 @@ func (e *UpstreamError) ShouldSwitchAccount() bool {
 		return false
 	}
 	switch e.Kind {
-	case ErrKindInvalid, ErrKindTooLarge, ErrKindBlocked:
+	case ErrKindInvalid, ErrKindTooLarge, ErrKindBlocked, ErrKindCompletion:
 		return false
 	}
 	switch e.StatusCode {

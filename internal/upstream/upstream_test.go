@@ -376,6 +376,7 @@ func TestMockUpstreamAIDPThreadReuseAndAttachments(t *testing.T) {
 		Slot:           "smart",
 		ThinkingEffort: "high",
 		ConversationID: "conv-1",
+		ThreadSession:  "conv-1",
 		Stream:         true,
 		Messages: []map[string]any{
 			{"role": "system", "content": "Be concise."},
@@ -398,12 +399,14 @@ func TestMockUpstreamAIDPThreadReuseAndAttachments(t *testing.T) {
 	res2, err := client.Chat(context.Background(), acct, ChatRequest{
 		Model:          "amazon-smart",
 		Slot:           "smart",
+		ThinkingEffort: "high",
 		ConversationID: "conv-1",
+		ThreadSession:  "conv-1",
 		Stream:         false,
 		Messages: []map[string]any{
 			{"role": "system", "content": "Be concise."},
 			{"role": "user", "content": "First turn question"},
-			{"role": "assistant", "content": "Hello from Quick!"},
+			{"role": "assistant", "content": "Hello from Quick!", "reasoning_content": res1.Reasoning},
 			{"role": "user", "content": "Second turn follow-up"},
 		},
 	}, nil)

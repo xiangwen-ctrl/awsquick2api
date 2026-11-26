@@ -637,3 +637,19 @@ func TestPanelModelVisibilityToggleWithAllowlist(t *testing.T) {
 		t.Fatalf("hidden missing amazon-fast: %v", got.Models.Hidden)
 	}
 }
+
+func TestInvalidDisablePayloadLeavesAccountEnabled(t *testing.T) {
+	cfg := config.Default()
+	cfg.AdminKey = "qka_test_panel"
+	p := pool.New(pool.Config{})
+	p.AddOrUpdate(&auth.Account{UID: "soc_demo_1"})
+	panel := New(Config{Pool: p, Live: config.NewLiveHolder(cfg)})
+	r := httptest.NewRequest(http.MethodPost, "/panel/api/accounts/soc_demo_1/disable", strings.NewReader(`{"reason":`))
+	r.Header.Set("Authorization", "Bearer "+cfg.AdminKey)
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	panel.ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest || p.Snapshot()[0].Disabled {
+		t.Fatalf("invalid request returned %d, disabled=%v", w.Code, p.Snapshot()[0].Disabled)
+	}
+}

@@ -309,8 +309,11 @@ func TestModelPermittedEnforcesAllowAndHidden(t *testing.T) {
 	if check(nil, []string{"amazon-smart"}, "amazon-smart") {
 		t.Fatal("hidden amazon-smart must be rejected")
 	}
-	if !check([]string{"amazon-fast"}, nil, "") {
-		t.Fatal("empty model maps to operator default and must be permitted")
+	if check([]string{"amazon-fast"}, nil, "") || check(nil, []string{"amazon-smart"}, "") {
+		t.Fatal("default model must satisfy the allowlist and hidden policy")
+	}
+	if !check([]string{"amazon-smart"}, nil, "") {
+		t.Fatal("allowed default model must be permitted")
 	}
 	// P2-3: unknown model names must not bypass allowlist or hidden default slot.
 	if check([]string{"smart"}, nil, "unknown-bypass-model") {
@@ -619,7 +622,7 @@ func TestUpstreamErrorScrubbedOnPublicEndpoints(t *testing.T) {
 		{"openai non-stream", "/v1/chat/completions", `{"model":"amazon-smart","messages":[{"role":"user","content":"hi"}]}`, http.StatusBadGateway},
 		{"openai stream", "/v1/chat/completions", `{"model":"amazon-smart","stream":true,"messages":[{"role":"user","content":"COMMIT_FIRST"}]}`, http.StatusOK},
 		{"anthropic non-stream", "/v1/messages", `{"model":"claude-sonnet-4-5","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`, http.StatusBadGateway},
-		{"anthropic stream", "/v1/messages", `{"model":"claude-sonnet-4-5","stream":true,"max_tokens":32,"messages":[{"role":"user","content":"COMMIT_FIRST"}]}`, http.StatusOK},
+		{"anthropic stream", "/v1/messages", `{"model":"claude-sonnet-4-5","stream":true,"messages":[{"role":"user","content":"COMMIT_FIRST"}]}`, http.StatusOK},
 		{"responses non-stream", "/v1/responses", `{"model":"amazon-smart","input":"hi"}`, http.StatusBadGateway},
 		{"responses stream", "/v1/responses", `{"model":"amazon-smart","stream":true,"input":"COMMIT_FIRST"}`, http.StatusOK},
 	}
