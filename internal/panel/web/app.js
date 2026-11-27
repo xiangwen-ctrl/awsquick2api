@@ -43,6 +43,23 @@
     showToast._t = setTimeout(() => el.classList.add("hidden"), 3200);
   }
 
+  function reportAsyncError(err) {
+    if (err?.message && err.message !== "unauthorized") {
+      showToast(err.message, true);
+    }
+  }
+
+  function copyText(text, successMsg) {
+    if (!navigator.clipboard?.writeText) {
+      showToast("当前浏览器环境不支持一键复制，请手动复制", true);
+      return;
+    }
+    navigator.clipboard
+      .writeText(text)
+      .then(() => showToast(successMsg))
+      .catch(() => showToast("复制失败，请手动复制", true));
+  }
+
   function esc(str) {
     return String(str ?? "")
       .replace(/&/g, "&amp;")
@@ -225,11 +242,16 @@
         sec.classList.toggle("active", sec.id === `tab-${tab}`);
       });
       $("page-title").textContent = tabTitles[tab] || tab;
-      if (tab === "models") loadModels();
-      if (tab === "keys") loadKeys();
-      if (tab === "requests") loadRequests();
-      if (tab === "config") loadConfig();
-      if (tab === "logs") loadLogs();
+      const tabLoaders = {
+        models: loadModels,
+        keys: loadKeys,
+        requests: loadRequests,
+        config: loadConfig,
+        logs: loadLogs,
+      };
+      if (tabLoaders[tab]) {
+        tabLoaders[tab]().catch(reportAsyncError);
+      }
     });
   });
 
@@ -493,7 +515,7 @@
       $("login-msg").textContent = `账号 ${view.account_label || view.account_uid} 已加密保存并加入账号池！建议点击“测试”验证连通性。`;
       $("login-msg").classList.remove("hidden");
       $("login-err").classList.add("hidden");
-      loadAll();
+      loadAll().catch(reportAsyncError);
     } else if (view.status === "failed" || view.status === "expired" || view.status === "cancelled") {
       stopLoginPoll();
       activeLoginId = "";
@@ -540,10 +562,10 @@
   });
 
   $("btn-login-copy").addEventListener("click", () => {
-    navigator.clipboard.writeText($("login-url-input").value).then(() => showToast("已复制登录链接"));
+    copyText($("login-url-input").value, "已复制登录链接");
   });
   $("btn-login-authz-copy").addEventListener("click", () => {
-    navigator.clipboard.writeText($("login-authz-input").value).then(() => showToast("已复制第 2 步授权链接"));
+    copyText($("login-authz-input").value, "已复制第 2 步授权链接");
   });
 
   $("btn-login-paste-submit").addEventListener("click", async () => {
@@ -770,7 +792,7 @@ wire_api = "responses"`;
   });
   ["openai", "claude", "codex"].forEach((name) => {
     $(`btn-copy-${name}`).addEventListener("click", () => {
-      navigator.clipboard.writeText($(`snippet-${name}`).textContent).then(() => showToast("已复制接入片段"));
+      copyText($(`snippet-${name}`).textContent, "已复制接入片段");
     });
   });
 
@@ -854,8 +876,8 @@ wire_api = "responses"`;
     const id = $("key-edit-id").value.trim();
     const name = $("key-edit-name").value.trim();
     const allowedModels = splitCSV($("key-edit-models").value);
-    const maxDaily = Math.max(0, parseInt($("key-edit-daily").value, 10) || 0);
-    const maxTokens = Math.max(0, parseInt($("key-edit-tokens").value, 10) || 0);
+    const maxDaily = Math.max(0, Number.parseInt($("key-edit-daily").value, 10) || 0);
+    const maxTokens = Math.max(0, Number.parseInt($("key-edit-tokens").value, 10) || 0);
     const expRaw = $("key-edit-expires").value.trim();
     let expiresAt = 0;
     if (expRaw) {
@@ -907,7 +929,7 @@ wire_api = "responses"`;
   });
 
   $("btn-key-secret-copy").addEventListener("click", () => {
-    navigator.clipboard.writeText($("key-secret-value").value).then(() => showToast("已复制访问密钥明文"));
+    copyText($("key-secret-value").value, "已复制访问密钥明文");
   });
 
   $("keys-tbody").addEventListener("click", async (e) => {
@@ -1193,5 +1215,5 @@ wire_api = "responses"`;
     }
   });
 
-  initSession();
+  initSession().catch(reportAsyncError);
 })();

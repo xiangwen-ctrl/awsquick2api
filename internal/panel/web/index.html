@@ -243,7 +243,7 @@
               <h3>最近请求</h3>
             </div>
             <div class="logs-controls">
-              <input id="requests-filter" type="search" class="filter-input" placeholder="筛选模型 / 密钥 / 账号 / 路径 / 状态..." />
+              <input id="requests-filter" type="search" class="filter-input" placeholder="筛选模型 / 密钥 / 账号 / 路径 / 状态..." aria-label="筛选请求记录" />
               <button type="button" id="btn-reload-reqs" class="btn small">刷新</button>
               <button type="button" id="btn-clear-reqs" class="btn danger small">清空记录</button>
             </div>
@@ -346,7 +346,7 @@
             </div>
           </div>
           <div id="config-env-banner" class="env-banner hidden"></div>
-          <textarea id="config-editor" class="mono-editor" rows="24" spellcheck="false"></textarea>
+          <textarea id="config-editor" class="mono-editor" rows="24" spellcheck="false" aria-label="配置文件 JSON 编辑器"></textarea>
           <p id="config-msg" class="status-msg hidden"></p>
           <p id="config-err" class="err-msg hidden"></p>
         </div>
@@ -358,7 +358,7 @@
           <div class="card-head">
             <h3>运行日志（最新在上）</h3>
             <div class="logs-controls">
-              <input id="logs-filter" type="search" class="filter-input" placeholder="过滤关键字..." />
+              <input id="logs-filter" type="search" class="filter-input" placeholder="过滤关键字..." aria-label="过滤运行日志关键字" />
               <button type="button" id="btn-export-logs" class="btn small">导出脱敏日志 (ZIP)</button>
               <button type="button" id="btn-reload-logs" class="btn small">刷新日志</button>
             </div>
@@ -415,7 +415,7 @@
       </div>
       <p class="muted">请立即复制保存该密钥。关闭此弹窗后无法再次查看明文（仅保留 SHA-256 哈希与掩码）。</p>
       <div class="secret-highlight">
-        <input id="key-secret-value" type="text" readonly />
+        <input id="key-secret-value" type="text" readonly aria-label="新建访问密钥明文" />
         <button type="button" id="btn-key-secret-copy" class="btn primary small">复制密钥</button>
       </div>
     </div>
@@ -510,7 +510,7 @@
           <span id="login-status-pill" class="pill warn">awaiting_discovery</span>
         </div>
         <div class="form-row">
-          <label class="muted">第 1 步：在独立无痕窗口中打开下方官方登录地址</label>
+          <label class="muted" for="login-url-input">第 1 步：在独立无痕窗口中打开下方官方登录地址</label>
           <div class="url-row">
             <input id="login-url-input" type="text" readonly class="mono-editor" />
             <a id="login-url-open" href="#" target="_blank" rel="noopener noreferrer" class="btn primary small">打开登录</a>
@@ -518,7 +518,7 @@
           </div>
         </div>
         <div id="login-authz-wrap" class="form-row hidden">
-          <label class="muted">第 2 步（远程无头模式）：请打开下方 AWS 授权页并同意</label>
+          <label class="muted" for="login-authz-input">第 2 步（远程无头模式）：请打开下方 AWS 授权页并同意</label>
           <div class="url-row">
             <input id="login-authz-input" type="text" readonly class="mono-editor" />
             <a id="login-authz-open" href="#" target="_blank" rel="noopener noreferrer" class="btn primary small">打开授权</a>
@@ -529,7 +529,7 @@
           <summary>远程 / 无头 Linux 服务器：手动粘贴浏览器跳转后的 localhost 回调地址</summary>
           <p class="muted" style="margin:6px 0;">若服务跑在远程 Linux 且未做 SSH 端口转发，浏览器停在无法打开的 <code>http://localhost:18080/...</code> 或 <code>http://127.0.0.1:18080/...</code> 时，复制地址栏完整 URL 粘贴到此处提交（第一步与第二步均在此粘贴）：</p>
           <div class="url-row">
-            <input id="login-paste-url" type="text" placeholder="http://localhost:18080/callback?nonce=... 或 http://127.0.0.1:18080/?code=..." />
+            <input id="login-paste-url" type="text" placeholder="http://localhost:18080/callback?nonce=... 或 http://127.0.0.1:18080/?code=..." aria-label="手动粘贴 OAuth 回调 URL" />
             <button type="button" id="btn-login-paste-submit" class="btn primary small">提交回调 URL</button>
           </div>
         </details>

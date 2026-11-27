@@ -345,7 +345,7 @@ func run(showGUIError *bool, logFileHint *string, closeLog *func()) error {
 	ctx, cancelApp := context.WithCancel(sigCtx)
 	defer cancelApp()
 
-	reqCtx, cancelReqs := context.WithCancel(context.Background())
+	reqCtx, cancelReqs := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelReqs()
 
 	ln, err := net.Listen("tcp", cfg.Listen)
@@ -356,7 +356,7 @@ func run(showGUIError *bool, logFileHint *string, closeLog *func()) error {
 
 	// The scheduler has its own context so token refresh keeps serving in-flight
 	// requests until the HTTP server has drained during shutdown.
-	schCtx, cancelSch := context.WithCancel(context.Background())
+	schCtx, cancelSch := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelSch()
 	var bgWG sync.WaitGroup
 	bgWG.Add(1)
