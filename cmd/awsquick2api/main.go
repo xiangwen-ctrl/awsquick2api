@@ -354,15 +354,19 @@ func run(showGUIError *bool, logFileHint *string, closeLog *func()) error {
 		return fmt.Errorf("http listen %s: %w", cfg.Listen, err)
 	}
 
-	// The scheduler has its own context so token refresh keeps serving in-flight
-	// requests until the HTTP server has drained during shutdown.
+	// The scheduler and periodic API-key usage flusher share a context so they keep
+	// running while in-flight HTTP requests drain during shutdown.
 	schCtx, cancelSch := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelSch()
 	var bgWG sync.WaitGroup
-	bgWG.Add(1)
+	bgWG.Add(2)
 	go func() {
 		defer bgWG.Done()
 		sch.Run(schCtx)
+	}()
+	go func() {
+		defer bgWG.Done()
+		keyStore.RunPeriodicFlush(schCtx, 0)
 	}()
 
 	srv := &http.Server{
@@ -422,7 +426,7 @@ func run(showGUIError *bool, logFileHint *string, closeLog *func()) error {
 	log.Printf("================================================================")
 
 	// finishShutdown runs once the HTTP server has drained (or been force-closed):
-	// OAuth callback servers -> scheduler -> pool state flush. rec.Close() runs last.
+	// OAuth callback servers -> scheduler & periodic flush -> final api-key/pool flush. rec.Close() runs last.
 	finishShutdown := func() {
 		closeCallbacks()
 		cancelSch()

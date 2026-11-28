@@ -3,6 +3,7 @@
 package apikeys
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -11,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"sort"
 	"strings"
@@ -105,27 +107,30 @@ type storeFile struct {
 
 // Store manages scoped inference API keys with atomic 0600 persistence.
 type Store struct {
-	path string
-	now  func() time.Time
+	path      string
+	now       func() time.Time
+	writeFile func(path string, data []byte, perm os.FileMode) error
 
-	mu        sync.Mutex
-	flushMu   sync.Mutex
-	byID      map[string]*KeyRecord
-	dirty     bool
-	lastFlush time.Time
+	mu         sync.Mutex
+	flushMu    sync.Mutex
+	byID       map[string]*KeyRecord
+	dirtyGen   uint64
+	flushedGen uint64
+	lastFlush  time.Time
 }
 
 // NewStore loads scoped keys from path (missing file starts empty).
 func NewStore(path string) (*Store, error) {
+	trimmed := strings.TrimSpace(path)
 	s := &Store{
-		path: path,
+		path: trimmed,
 		now:  time.Now,
 		byID: map[string]*KeyRecord{},
 	}
-	if strings.TrimSpace(path) == "" {
+	if trimmed == "" {
 		return s, nil
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(trimmed)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return s, nil
@@ -247,14 +252,34 @@ func (s *Store) viewLocked(rec *KeyRecord, now time.Time) KeyView {
 	}
 }
 
-func (s *Store) snapshotRecordsLocked() []KeyRecord {
-	out := make([]KeyRecord, 0, len(s.byID))
-	for _, rec := range s.byID {
-		cp := *rec
-		if len(rec.AllowedModels) > 0 {
-			cp.AllowedModels = append([]string(nil), rec.AllowedModels...)
+func (s *Store) hasPath() bool {
+	return strings.TrimSpace(s.path) != ""
+}
+
+func cloneRecord(rec *KeyRecord) KeyRecord {
+	cp := *rec
+	if len(rec.AllowedModels) > 0 {
+		cp.AllowedModels = append([]string(nil), rec.AllowedModels...)
+	}
+	return cp
+}
+
+func (s *Store) snapshotRecordsLocked(override *KeyRecord, excludeID string) []KeyRecord {
+	out := make([]KeyRecord, 0, len(s.byID)+1)
+	overridden := false
+	for id, rec := range s.byID {
+		if excludeID != "" && id == excludeID {
+			continue
 		}
-		out = append(out, cp)
+		if override != nil && id == override.ID {
+			out = append(out, cloneRecord(override))
+			overridden = true
+			continue
+		}
+		out = append(out, cloneRecord(rec))
+	}
+	if override != nil && !overridden && (excludeID == "" || override.ID != excludeID) {
+		out = append(out, cloneRecord(override))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].CreatedAt != out[j].CreatedAt {
@@ -265,17 +290,36 @@ func (s *Store) snapshotRecordsLocked() []KeyRecord {
 	return out
 }
 
-func (s *Store) writeDisk(records []KeyRecord) error {
-	if strings.TrimSpace(s.path) == "" {
+// writeRecordsLocked persists records to disk. Callers must hold s.flushMu and must NOT hold s.mu.
+func (s *Store) writeRecordsLocked(records []KeyRecord) error {
+	if !s.hasPath() {
 		return nil
 	}
-	s.flushMu.Lock()
-	defer s.flushMu.Unlock()
 	raw, err := json.MarshalIndent(storeFile{Version: 1, Keys: records}, "", "  ")
 	if err != nil {
 		return err
 	}
-	return safefile.WriteAtomic(s.path, append(raw, '\n'), 0o600)
+	writeFn := s.writeFile
+	if writeFn == nil {
+		writeFn = safefile.WriteAtomic
+	}
+	return writeFn(s.path, append(raw, '\n'), 0o600)
+}
+
+// markPersistedLocked advances generation tracking after a successful write that
+// captured all in-memory state up to baseGen plus the just-committed mutation.
+func (s *Store) markPersistedLocked(baseGen uint64, now time.Time) {
+	if s.dirtyGen == baseGen {
+		s.dirtyGen++
+		s.flushedGen = s.dirtyGen
+	} else if baseGen > s.flushedGen {
+		// Concurrent usage updates bumped dirtyGen while writing; record that state
+		// up to baseGen is durable while leaving dirtyGen > flushedGen for the next flush.
+		s.flushedGen = baseGen
+	}
+	if s.hasPath() && (s.lastFlush.IsZero() || now.After(s.lastFlush)) {
+		s.lastFlush = now
+	}
 }
 
 // List returns panel-safe views of all scoped keys ordered by creation time.
@@ -286,7 +330,7 @@ func (s *Store) List() []KeyView {
 	now := s.clock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	recs := s.snapshotRecordsLocked()
+	recs := s.snapshotRecordsLocked(nil, "")
 	views := make([]KeyView, 0, len(recs))
 	for i := range recs {
 		views = append(views, s.viewLocked(&recs[i], now))
@@ -307,6 +351,10 @@ func (s *Store) Create(in CreateInput) (KeyView, string, error) {
 	if in.MaxDailyRequests < 0 || in.MaxTotalTokens < 0 || in.ExpiresAt < 0 {
 		return KeyView{}, "", fmt.Errorf("limits and expires_at must be non-negative")
 	}
+
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
 	now := s.clock()
 	plain := "qk_" + randomHex(20)
 	rec := &KeyRecord{
@@ -327,19 +375,19 @@ func (s *Store) Create(in CreateInput) (KeyView, string, error) {
 		s.mu.Unlock()
 		return KeyView{}, "", ErrKeyLimit
 	}
-	s.byID[rec.ID] = rec
-	records := s.snapshotRecordsLocked()
-	view := s.viewLocked(rec, now)
-	s.dirty = false
-	s.lastFlush = now
+	baseGen := s.dirtyGen
+	records := s.snapshotRecordsLocked(rec, "")
 	s.mu.Unlock()
 
-	if err := s.writeDisk(records); err != nil {
-		s.mu.Lock()
-		delete(s.byID, rec.ID)
-		s.mu.Unlock()
+	if err := s.writeRecordsLocked(records); err != nil {
 		return KeyView{}, "", err
 	}
+
+	s.mu.Lock()
+	s.byID[rec.ID] = rec
+	view := s.viewLocked(rec, now)
+	s.markPersistedLocked(baseGen, now)
+	s.mu.Unlock()
 	return view, plain, nil
 }
 
@@ -348,6 +396,10 @@ func (s *Store) Update(id string, patch UpdatePatch) (KeyView, error) {
 	if s == nil {
 		return KeyView{}, errors.New("api key store unavailable")
 	}
+
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
 	now := s.clock()
 	s.mu.Lock()
 	rec, ok := s.byID[id]
@@ -355,62 +407,61 @@ func (s *Store) Update(id string, patch UpdatePatch) (KeyView, error) {
 		s.mu.Unlock()
 		return KeyView{}, ErrKeyNotFound
 	}
-	prev := *rec
-	if len(rec.AllowedModels) > 0 {
-		prev.AllowedModels = append([]string(nil), rec.AllowedModels...)
-	}
+	updated := cloneRecord(rec)
 	if patch.Name != nil {
 		name, err := cleanName(*patch.Name)
 		if err != nil {
 			s.mu.Unlock()
 			return KeyView{}, err
 		}
-		rec.Name = name
+		updated.Name = name
 	}
 	if patch.Enabled != nil {
-		rec.Enabled = *patch.Enabled
+		updated.Enabled = *patch.Enabled
 	}
 	if patch.AllowedModels != nil {
-		rec.AllowedModels = cleanModelList(*patch.AllowedModels)
+		updated.AllowedModels = cleanModelList(*patch.AllowedModels)
 	}
 	if patch.ExpiresAt != nil {
 		if *patch.ExpiresAt < 0 {
-			*rec = prev
 			s.mu.Unlock()
 			return KeyView{}, fmt.Errorf("expires_at must be non-negative")
 		}
-		rec.ExpiresAt = *patch.ExpiresAt
+		updated.ExpiresAt = *patch.ExpiresAt
 	}
 	if patch.MaxDailyRequests != nil {
 		if *patch.MaxDailyRequests < 0 {
-			*rec = prev
 			s.mu.Unlock()
 			return KeyView{}, fmt.Errorf("max_daily_requests must be non-negative")
 		}
-		rec.MaxDailyRequests = *patch.MaxDailyRequests
+		updated.MaxDailyRequests = *patch.MaxDailyRequests
 	}
 	if patch.MaxTotalTokens != nil {
 		if *patch.MaxTotalTokens < 0 {
-			*rec = prev
 			s.mu.Unlock()
 			return KeyView{}, fmt.Errorf("max_total_tokens must be non-negative")
 		}
-		rec.MaxTotalTokens = *patch.MaxTotalTokens
+		updated.MaxTotalTokens = *patch.MaxTotalTokens
 	}
-	records := s.snapshotRecordsLocked()
-	view := s.viewLocked(rec, now)
-	s.dirty = false
-	s.lastFlush = now
+	baseGen := s.dirtyGen
+	records := s.snapshotRecordsLocked(&updated, "")
 	s.mu.Unlock()
 
-	if err := s.writeDisk(records); err != nil {
-		s.mu.Lock()
-		if cur, exists := s.byID[id]; exists {
-			*cur = prev
-		}
-		s.mu.Unlock()
+	if err := s.writeRecordsLocked(records); err != nil {
 		return KeyView{}, err
 	}
+
+	s.mu.Lock()
+	cur := s.byID[id]
+	cur.Name = updated.Name
+	cur.Enabled = updated.Enabled
+	cur.AllowedModels = updated.AllowedModels
+	cur.ExpiresAt = updated.ExpiresAt
+	cur.MaxDailyRequests = updated.MaxDailyRequests
+	cur.MaxTotalTokens = updated.MaxTotalTokens
+	view := s.viewLocked(cur, now)
+	s.markPersistedLocked(baseGen, now)
+	s.mu.Unlock()
 	return view, nil
 }
 
@@ -419,25 +470,28 @@ func (s *Store) Delete(id string) error {
 	if s == nil {
 		return errors.New("api key store unavailable")
 	}
+
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
 	now := s.clock()
 	s.mu.Lock()
-	prev, ok := s.byID[id]
-	if !ok {
+	if _, ok := s.byID[id]; !ok {
 		s.mu.Unlock()
 		return ErrKeyNotFound
 	}
-	delete(s.byID, id)
-	records := s.snapshotRecordsLocked()
-	s.dirty = false
-	s.lastFlush = now
+	baseGen := s.dirtyGen
+	records := s.snapshotRecordsLocked(nil, id)
 	s.mu.Unlock()
 
-	if err := s.writeDisk(records); err != nil {
-		s.mu.Lock()
-		s.byID[id] = prev
-		s.mu.Unlock()
+	if err := s.writeRecordsLocked(records); err != nil {
 		return err
 	}
+
+	s.mu.Lock()
+	delete(s.byID, id)
+	s.markPersistedLocked(baseGen, now)
+	s.mu.Unlock()
 	return nil
 }
 
@@ -518,10 +572,9 @@ func (s *Store) RecordUsage(id string, tokens int) {
 	now := s.clock()
 	today := now.UTC().Format("2006-01-02")
 
-	var records []KeyRecord
+	shouldFlush := false
 	s.mu.Lock()
-	rec, ok := s.byID[id]
-	if ok {
+	if rec, ok := s.byID[id]; ok {
 		if rec.DailyDate != today {
 			rec.DailyDate = today
 			rec.DailyRequests = 0
@@ -530,47 +583,80 @@ func (s *Store) RecordUsage(id string, tokens int) {
 		rec.DailyRequests++
 		rec.TotalTokens += int64(tokens)
 		rec.LastUsedAt = now.UnixMilli()
-		s.dirty = true
-		if s.path != "" && (s.lastFlush.IsZero() || now.Sub(s.lastFlush) >= usageFlushWindow) {
-			records = s.snapshotRecordsLocked()
-			s.dirty = false
+		s.dirtyGen++
+		if s.hasPath() && (s.lastFlush.IsZero() || now.Sub(s.lastFlush) >= usageFlushWindow) {
+			shouldFlush = true
 			s.lastFlush = now
 		}
 	}
 	s.mu.Unlock()
 
-	if records != nil {
-		if err := s.writeDisk(records); err != nil {
-			s.mu.Lock()
-			s.dirty = true
-			s.mu.Unlock()
-		}
+	if shouldFlush {
+		_ = s.Flush()
 	}
 }
 
 // Flush persists any buffered usage counter updates to disk.
 func (s *Store) Flush() error {
-	if s == nil || strings.TrimSpace(s.path) == "" {
+	if s == nil || !s.hasPath() {
 		return nil
 	}
-	now := s.clock()
+
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
 	s.mu.Lock()
-	if !s.dirty {
+	if s.dirtyGen == s.flushedGen {
 		s.mu.Unlock()
 		return nil
 	}
-	records := s.snapshotRecordsLocked()
-	s.dirty = false
-	s.lastFlush = now
+	gen := s.dirtyGen
+	now := s.clock()
+	records := s.snapshotRecordsLocked(nil, "")
 	s.mu.Unlock()
 
-	if err := s.writeDisk(records); err != nil {
-		s.mu.Lock()
-		s.dirty = true
-		s.mu.Unlock()
+	if err := s.writeRecordsLocked(records); err != nil {
 		return err
 	}
+
+	s.mu.Lock()
+	if gen > s.flushedGen {
+		s.flushedGen = gen
+	}
+	if s.lastFlush.IsZero() || now.After(s.lastFlush) {
+		s.lastFlush = now
+	}
+	s.mu.Unlock()
 	return nil
+}
+
+// RunPeriodicFlush persists buffered usage counter updates on a fixed interval
+// (defaulting to usageFlushWindow when interval <= 0) until ctx is cancelled.
+// Clean stores perform no disk writes, and transient write errors remain dirty
+// so subsequent ticks retry automatically.
+func (s *Store) RunPeriodicFlush(ctx context.Context, interval time.Duration) {
+	if s == nil || !s.hasPath() || ctx == nil || ctx.Err() != nil {
+		return
+	}
+	if interval <= 0 {
+		interval = usageFlushWindow
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if ctx.Err() != nil {
+				return
+			}
+			if err := s.Flush(); err != nil {
+				log.Printf("WARN: [apikeys] periodic flush failed: %v", err)
+			}
+		}
+	}
 }
 
 // ModelAllowed checks whether any normalized candidate matches the scoped key's
